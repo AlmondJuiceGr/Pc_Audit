@@ -1,13 +1,47 @@
-# pc_audit
+# PC Audit
 
-Enterprise desktop audit dashboard for collecting workstation inventory, running Windows device checks, and viewing manual test results from network clients.
+Εργαλεία για καταγραφή και έλεγχο υπολογιστών. Η εφαρμογή συλλέγει στοιχεία υλικού, εκτελεί διαγνωστικούς ελέγχους, αποθηκεύει εγγραφές τοπικά και υποστηρίζει παρακολούθηση σταθμών μέσω δικτύου.
 
-## Main Files
+## Βασικές δυνατότητες
 
-- `enterprise_tabs_app.pyw` - Tkinter desktop app.
-- `enterprise_tabs_app.py` - console launcher for the `.pyw` app.
-- `network_job_server.py` - local network job/client registration server.
-- `register_client.py` - client inventory and diagnostics reporter.
-- `*.bat` / `*.sh` - helper launch scripts for Windows and Linux.
+- Καταγραφή στοιχείων υπολογιστή και εξοπλισμού σε φόρμα.
+- Αυτόματοι και χειροκίνητοι έλεγχοι συσκευών.
+- Εξαγωγή αναφορών σε Excel, JSON, CSV και TXT.
+- Εγγραφή υπολογιστών και αρχειοθέτηση αποτελεσμάτων μέσω τοπικού server.
+- Δημοσίευση εργασιών προς σταθμούς του δικτύου.
 
-Runtime databases, exports, cache files, and logs are intentionally ignored by Git.
+## Εκκίνηση σε Windows
+
+```bat
+py -3 -m pip install -r requirements.txt
+start_pc_audit_app.bat
+```
+
+Για τοπικό έλεγχο χωρίς server, εκτελέστε `start_pc_audit.bat`. Για έλεγχο μέσω δικτύου, ξεκινήστε και τον server με `start_job_server.bat`.
+
+## Πολλοί υπολογιστές
+
+1. Σε έναν υπολογιστή, εκτελέστε `start_job_server.bat`.
+2. Στο Dashboard ορίστε τη διεύθυνση του server, π.χ. `http://192.168.1.50:8765`.
+3. Σε κάθε σταθμό, ορίστε την ίδια διεύθυνση στο `register_this_client.bat` και εκτελέστε το.
+4. Δείτε τους σταθμούς και τα αποτελέσματα στις καρτέλες **Network Jobs**, **Device Results** και **Audit Archive**.
+
+Οι αναφορές του αρχείου ελέγχου αποθηκεύονται στον φάκελο `audit_reports`. Για εκτέλεση από γραμμή εντολών:
+
+```bat
+py -3 pc_audit_report.py --cli --save
+```
+
+## Κύρια αρχεία
+
+- `pc_audit_app.pyw` — κύριο γραφικό περιβάλλον.
+- `pc_audit_report.py` — αυτόνομο εργαλείο ελέγχου και αναφορών.
+- `register_client.py` — συλλογή και αποστολή στοιχείων σταθμού.
+- `network_job_server.py` — server για σταθμούς, αποτελέσματα και εργασίες.
+- `pxe_wim_toolkit/` — προαιρετικά εργαλεία WinPE/WIM για ανάπτυξη Windows.
+
+Οι τοπικές εγγραφές αποθηκεύονται στο `app.db` και τα δεδομένα δικτύου στο `network_jobs.db`. Η αρχική σύνδεση του Dashboard είναι `admin / 1234`. Ο network server δεν απαιτεί σύνδεση χρήστη, γι’ αυτό χρησιμοποιήστε τον μόνο σε έμπιστο τοπικό δίκτυο.
+
+## Χρήση τεχνητής νοημοσύνης
+
+Η ανάπτυξη του PC Audit και των εργαλείων του έγινε με υποστήριξη τεχνητής νοημοσύνης (AI).

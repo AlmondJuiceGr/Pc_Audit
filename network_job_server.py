@@ -68,6 +68,21 @@ def init_db():
     if "inventory" not in client_columns:
         c.execute("ALTER TABLE clients ADD COLUMN inventory TEXT")
     c.execute(
+        """CREATE TABLE IF NOT EXISTS audit_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT NOT NULL,
+            username TEXT,
+            role TEXT,
+            app_version TEXT,
+            platform TEXT,
+            inventory TEXT,
+            diagnostics_summary TEXT,
+            created_at TEXT
+        )"""
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_audit_records_client ON audit_records (client_name)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_audit_records_created ON audit_records (created_at)")
+    c.execute(
         """CREATE TABLE IF NOT EXISTS server_settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -88,6 +103,30 @@ def row_to_job(row):
     except json.JSONDecodeError:
         job["payload"] = {}
     return job
+
+
+def parse_json_object(value):
+    try:
+        data = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def diagnostics_summary_from_inventory(inventory):
+    diagnostics = inventory.get("Diagnostics", {}) if isinstance(inventory, dict) else {}
+    summary = diagnostics.get("summary", {}) if isinstance(diagnostics, dict) else {}
+    return summary if isinstance(summary, dict) else {}
+
+
+def row_to_audit(row, include_inventory=True):
+    audit = dict(row)
+    audit["diagnostics_summary"] = parse_json_object(audit.get("diagnostics_summary"))
+    if include_inventory:
+        audit["inventory"] = parse_json_object(audit.get("inventory"))
+    else:
+        audit.pop("inventory", None)
+    return audit
 
 
 def send_json(handler, status, data):
@@ -137,6 +176,14 @@ class JobHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/clients":
             self.handle_list_clients()
+            return
+
+        if parsed.path == "/audits":
+            self.handle_list_audits(parsed)
+            return
+
+        if parsed.path.startswith("/audits/"):
+            self.handle_get_audit(parsed)
             return
 
         if parsed.path == "/settings":
@@ -236,6 +283,52 @@ class JobHandler(BaseHTTPRequestHandler):
 
         send_json(self, 200, {"ok": True, "clients": clients})
 
+    def handle_list_audits(self, parsed):
+        params = parse_qs(parsed.query)
+        client = params.get("client", [""])[0].strip()
+        limit_text = params.get("limit", ["500"])[0].strip()
+        try:
+            limit = max(1, min(int(limit_text), 5000))
+        except ValueError:
+            limit = 500
+
+        query = (
+            "SELECT id, client_name, username, role, app_version, platform, diagnostics_summary, created_at "
+            "FROM audit_records"
+        )
+        values = []
+        if client:
+            query += " WHERE client_name = ?"
+            values.append(client)
+        query += " ORDER BY id DESC LIMIT ?"
+        values.append(limit)
+
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute(query, values)
+        audits = [row_to_audit(row, include_inventory=False) for row in c.fetchall()]
+        conn.close()
+
+        send_json(self, 200, {"ok": True, "audits": audits})
+
+    def handle_get_audit(self, parsed):
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) != 2 or not parts[1].isdigit():
+            send_json(self, 400, {"ok": False, "error": "Invalid audit id"})
+            return
+
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT * FROM audit_records WHERE id=?", (int(parts[1]),))
+        row = c.fetchone()
+        conn.close()
+
+        if not row:
+            send_json(self, 404, {"ok": False, "error": "Audit record not found"})
+            return
+
+        send_json(self, 200, {"ok": True, "audit": row_to_audit(row, include_inventory=True)})
+
     def handle_get_settings(self):
         conn = get_conn()
         c = conn.cursor()
@@ -296,13 +389,24 @@ class JobHandler(BaseHTTPRequestHandler):
             inventory = {}
 
         timestamp = now()
+        inventory_json = json.dumps(inventory, ensure_ascii=False)
+        summary_json = json.dumps(diagnostics_summary_from_inventory(inventory), ensure_ascii=False)
         conn = get_conn()
         c = conn.cursor()
         c.execute(
             """INSERT OR REPLACE INTO clients (name, username, role, app_version, platform, inventory, last_seen)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (name, username, role, app_version, client_platform, json.dumps(inventory, ensure_ascii=False), timestamp),
+            (name, username, role, app_version, client_platform, inventory_json, timestamp),
         )
+        c.execute("SELECT inventory FROM audit_records WHERE client_name=? ORDER BY id DESC LIMIT 1", (name,))
+        previous = c.fetchone()
+        if not previous or (previous["inventory"] or "") != inventory_json:
+            c.execute(
+                """INSERT INTO audit_records
+                   (client_name, username, role, app_version, platform, inventory, diagnostics_summary, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (name, username, role, app_version, client_platform, inventory_json, summary_json, timestamp),
+            )
         conn.commit()
         conn.close()
 
@@ -387,7 +491,7 @@ class JobHandler(BaseHTTPRequestHandler):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Enterprise Desktop System network job server.")
+    parser = argparse.ArgumentParser(description="PC Audit network job server.")
     parser.add_argument("--host", default=HOST, help="Bind address. Use 0.0.0.0 for LAN clients.")
     parser.add_argument("--port", type=int, default=PORT, help="Server port.")
     parser.add_argument("--db", default=DB_NAME, help="SQLite database path.")

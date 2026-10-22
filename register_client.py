@@ -76,12 +76,92 @@ def powershell_value(script):
     return run_command(command)
 
 
+def wmic_value(alias, prop, where=""):
+    command = ["wmic", alias]
+    if where:
+        command.extend(["where", where])
+    command.extend(["get", prop, "/value"])
+    output = run_command(command, timeout=8)
+    prefix = f"{prop}="
+    for line in output.splitlines():
+        line = line.strip()
+        if line.lower().startswith(prefix.lower()):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def wmic_lines(alias, props, limit=8):
+    output = run_command(["wmic", alias, "get", ",".join(props), "/format:csv"], timeout=10)
+    lines = []
+    for raw_line in output.splitlines():
+        parts = [part.strip() for part in raw_line.split(",")]
+        if len(parts) < len(props) + 1 or parts[0].lower() == "node":
+            continue
+        values = [part for part in parts[1:] if part]
+        if values:
+            lines.append(" | ".join(values))
+        if len(lines) >= limit:
+            break
+    return "; ".join(lines)
+
+
+def registry_value(path, name):
+    output = run_command(["reg", "query", path, "/v", name], timeout=6)
+    for line in output.splitlines():
+        if name.lower() in line.lower():
+            parts = line.split()
+            if len(parts) >= 3:
+                return " ".join(parts[2:]).strip()
+    return ""
+
+
+def first_available(*values):
+    for value in values:
+        line = first_line(value)
+        if line:
+            return line
+    return ""
+
+
+def windows_value(cim_script, wmic_alias="", wmic_prop="", registry_path="", registry_name=""):
+    values = [powershell_value(cim_script)]
+    if wmic_alias and wmic_prop:
+        values.append(wmic_value(wmic_alias, wmic_prop))
+    if registry_path and registry_name:
+        values.append(registry_value(registry_path, registry_name))
+    return first_available(*values)
+
+
 def first_line(value):
     for line in str(value).splitlines():
         line = line.strip()
         if line:
             return line
     return ""
+
+
+def clean_serial_number(value):
+    serial = first_line(value)
+    if not serial:
+        return ""
+    normalized = serial.strip().lower()
+    invalid_values = {
+        "default string",
+        "to be filled by o.e.m.",
+        "to be filled by oem",
+        "system serial number",
+        "serial number",
+        "none",
+        "unknown",
+        "not specified",
+        "not available",
+        "n/a",
+        "na",
+        "0",
+    }
+    if normalized in invalid_values:
+        return ""
+    return serial
 
 
 def read_text_file(path):
@@ -109,9 +189,139 @@ def format_gb(bytes_value):
     return f"{rounded} GB" if rounded > 0 else ""
 
 
+def join_lines(value, limit=6):
+    lines = [line.strip() for line in str(value).splitlines() if line.strip()]
+    return "; ".join(lines[:limit])
+
+
+def windows_domain_or_workgroup():
+    return first_line(
+        powershell_value(
+            "$cs=Get-CimInstance Win32_ComputerSystem; "
+            "if ($cs.PartOfDomain) { 'Domain: ' + $cs.Domain } else { 'Workgroup: ' + $cs.Workgroup }"
+        )
+    )
+
+
+def windows_secure_boot():
+    value = first_line(powershell_value("try { (Confirm-SecureBootUEFI).ToString() } catch { '' }"))
+    return value
+
+
+def windows_tpm_status():
+    return first_line(
+        powershell_value(
+            "try { $t=Get-Tpm; if ($null -ne $t.TpmPresent) { "
+            "'Present=' + $t.TpmPresent + '; Ready=' + $t.TpmReady + '; Enabled=' + $t.TpmEnabled } } catch { '' }"
+        )
+    )
+
+
+def windows_disk_details():
+    details = join_lines(
+        powershell_value(
+            "Get-CimInstance Win32_DiskDrive | Select-Object -First 8 | "
+            "ForEach-Object { $_.Model + ' | ' + $_.InterfaceType + ' | ' + $_.MediaType + ' | ' + "
+            "([math]::Round($_.Size / 1GB).ToString() + ' GB') }"
+        ),
+        limit=8,
+    )
+    if details:
+        return details
+    return wmic_lines("diskdrive", ["Model", "InterfaceType", "MediaType", "Size"], limit=8)
+
+
+def windows_volume_details():
+    details = join_lines(
+        powershell_value(
+            "Get-CimInstance Win32_LogicalDisk -Filter \"DriveType=3\" | "
+            "ForEach-Object { $_.DeviceID + ' ' + ([math]::Round($_.Size / 1GB).ToString() + ' GB') + "
+            "' free ' + ([math]::Round($_.FreeSpace / 1GB).ToString() + ' GB') }"
+        ),
+        limit=8,
+    )
+    if details:
+        return details
+    return wmic_lines("logicaldisk", ["DeviceID", "Size", "FreeSpace"], limit=8)
+
+
+def windows_network_details():
+    details = join_lines(
+        powershell_value(
+            "Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled } | "
+            "Select-Object -First 6 | ForEach-Object { $_.Description + ' | MAC ' + $_.MACAddress + "
+            "' | IP ' + (($_.IPAddress | Where-Object { $_ -notlike '*:*' }) -join ', ') }"
+        ),
+        limit=6,
+    )
+    if details:
+        return details
+    return join_lines(run_command(["ipconfig", "/all"], timeout=8), limit=20)
+
+
+def windows_battery_details():
+    return first_line(
+        powershell_value(
+            "$b=Get-CimInstance Win32_Battery | Select-Object -First 1; "
+            "if ($b) { $b.Name + ' | ' + $b.EstimatedChargeRemaining + '% | status ' + $b.BatteryStatus }"
+        )
+    )
+
+
+def windows_ram_slots():
+    used = first_line(powershell_value("(Get-CimInstance Win32_PhysicalMemory | Measure-Object).Count"))
+    total = first_line(
+        powershell_value(
+            "$arrays=Get-CimInstance Win32_PhysicalMemoryArray; "
+            "if ($arrays) { ($arrays | Measure-Object -Property MemoryDevices -Sum).Sum }"
+        )
+    )
+    if used and total:
+        return f"{used} / {total}"
+    if used:
+        return used
+    used = first_line(wmic_value("memorychip", "BankLabel"))
+    total = wmic_value("memphysical", "MemoryDevices")
+    if used and total:
+        count = len([line for line in run_command(["wmic", "memorychip", "get", "BankLabel"], timeout=8).splitlines() if line.strip() and "banklabel" not in line.lower()])
+        return f"{count} / {total}" if count else total
+    return ""
+
+
+def linux_command_lines(command, timeout=6, limit=6):
+    return join_lines(run_command(command, timeout=timeout), limit=limit)
+
+
+def linux_ram_slots():
+    dmidecode = shutil.which("dmidecode")
+    if not dmidecode:
+        return ""
+    output = run_command([dmidecode, "-t", "memory"], timeout=8)
+    if not output:
+        return ""
+    slots = 0
+    used = 0
+    in_device = False
+    current_has_size = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line == "Memory Device":
+            if in_device:
+                used += 1 if current_has_size else 0
+            slots += 1
+            in_device = True
+            current_has_size = False
+        elif in_device and line.startswith("Size:") and "No Module Installed" not in line:
+            current_has_size = True
+    if in_device:
+        used += 1 if current_has_size else 0
+    return f"{used} / {slots}" if slots else ""
+
+
 def chassis_label(value):
     try:
-        chassis = int(str(value).strip().split()[0])
+        cleaned = str(value).strip().replace("{", "").replace("}", "").replace(",", " ")
+        chassis = int(cleaned.split()[0])
     except (TypeError, ValueError, IndexError):
         return ""
     if chassis in {8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32}:
@@ -1409,7 +1619,10 @@ def collect_inventory():
     system = platform.system().lower()
 
     if system.startswith("win"):
-        chassis = first_line(powershell_value("(Get-CimInstance Win32_SystemEnclosure).ChassisTypes[0]"))
+        chassis = first_available(
+            powershell_value("(Get-CimInstance Win32_SystemEnclosure).ChassisTypes[0]"),
+            wmic_value("systemenclosure", "ChassisTypes"),
+        )
         product_type = chassis_label(chassis)
         disk_info = first_line(
             powershell_value(
@@ -1422,23 +1635,79 @@ def collect_inventory():
             disk_type, disk_size = [part.strip() for part in disk_info.split("|", 1)]
             if disk_type.upper() == "SSD":
                 disk_type = "SATA SSD"
+        if not disk_size:
+            disk_size = format_gb(wmic_value("diskdrive", "Size"))
+        if not disk_type:
+            disk_type = first_available(wmic_value("diskdrive", "MediaType"), wmic_value("diskdrive", "InterfaceType"))
+
+        serial = clean_serial_number(windows_value("(Get-CimInstance Win32_BIOS).SerialNumber", "bios", "SerialNumber"))
+        if not serial:
+            serial = clean_serial_number(
+                windows_value("(Get-CimInstance Win32_ComputerSystemProduct).IdentifyingNumber", "csproduct", "IdentifyingNumber")
+            )
+        if not serial:
+            serial = clean_serial_number(windows_value("(Get-CimInstance Win32_BaseBoard).SerialNumber", "baseboard", "SerialNumber"))
+        os_caption = windows_value(
+            "(Get-CimInstance Win32_OperatingSystem).Caption",
+            "os",
+            "Caption",
+            "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+            "ProductName",
+        )
+        os_version = first_line(
+            powershell_value(
+                "$os=Get-CimInstance Win32_OperatingSystem; $os.Version + ' build ' + $os.BuildNumber"
+            )
+        )
+        if not os_version:
+            os_version = first_available(
+                wmic_value("os", "Version"),
+                registry_value("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentBuild"),
+            )
+        motherboard = first_line(
+            powershell_value(
+                "$bb=Get-CimInstance Win32_BaseBoard; $bb.Manufacturer + ' ' + $bb.Product"
+            )
+        )
+        if not motherboard:
+            motherboard = first_available(
+                f"{wmic_value('baseboard', 'Manufacturer')} {wmic_value('baseboard', 'Product')}".strip(),
+                wmic_value("baseboard", "Product"),
+            )
+        bios_version = windows_value("(Get-CimInstance Win32_BIOS).SMBIOSBIOSVersion", "bios", "SMBIOSBIOSVersion")
 
         inventory = {
+            "Computer name": socket.gethostname(),
+            "Current user": getpass.getuser(),
+            "OS": os_caption,
+            "OS version": os_version,
+            "OS architecture": windows_value("(Get-CimInstance Win32_OperatingSystem).OSArchitecture", "os", "OSArchitecture"),
+            "Domain / Workgroup": windows_domain_or_workgroup(),
             "Product type": product_type,
-            "Manufacturer": first_line(powershell_value("(Get-CimInstance Win32_ComputerSystem).Manufacturer")),
-            "Model": first_line(powershell_value("(Get-CimInstance Win32_ComputerSystem).Model")),
+            "Manufacturer": windows_value("(Get-CimInstance Win32_ComputerSystem).Manufacturer", "computersystem", "Manufacturer"),
+            "Model": windows_value("(Get-CimInstance Win32_ComputerSystem).Model", "computersystem", "Model"),
             "Chassis type": product_type,
-            "Part number": first_line(powershell_value("(Get-CimInstance Win32_ComputerSystemProduct).SKUNumber")),
-            "Serial number": first_line(powershell_value("(Get-CimInstance Win32_BIOS).SerialNumber")),
-            "Processor": first_line(powershell_value("(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)")),
-            "RAM size": first_line(
-                powershell_value("[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB).ToString() + ' GB'")
+            "Part number": windows_value("(Get-CimInstance Win32_ComputerSystemProduct).SKUNumber", "csproduct", "SKUNumber"),
+            "Serial number": serial,
+            "Motherboard": motherboard,
+            "BIOS version": bios_version,
+            "Secure Boot": windows_secure_boot(),
+            "TPM": windows_tpm_status(),
+            "Processor": windows_value("(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)", "cpu", "Name"),
+            "RAM size": first_available(
+                powershell_value("[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB).ToString() + ' GB'"),
+                format_gb(wmic_value("computersystem", "TotalPhysicalMemory")),
             ),
+            "RAM slots used": windows_ram_slots(),
             "Disk type": disk_type,
             "Disk size": disk_size,
-            "Optical drive": first_line(powershell_value("(Get-CimInstance Win32_CDROMDrive | Select-Object -First 1 -ExpandProperty Name)")),
-            "Video model": first_line(powershell_value("(Get-CimInstance Win32_VideoController | Select-Object -First 1 -ExpandProperty Name)")),
+            "Disk details": windows_disk_details(),
+            "Volumes": windows_volume_details(),
+            "Optical drive": windows_value("(Get-CimInstance Win32_CDROMDrive | Select-Object -First 1 -ExpandProperty Name)", "cdrom", "Name"),
+            "Video model": windows_value("(Get-CimInstance Win32_VideoController | Select-Object -First 1 -ExpandProperty Name)", "videocontroller", "Name"),
             "LCD type": infer_screen_type_from_text(windows_monitor_text()),
+            "Network adapters": windows_network_details(),
+            "Battery": windows_battery_details(),
         }
     elif system == "linux":
         disk_type, disk_size = linux_disk_info()
@@ -1459,19 +1728,33 @@ def collect_inventory():
                 video = line.split(":", 2)[-1].strip()
                 break
         product_type = chassis_label(read_text_file("/sys/class/dmi/id/chassis_type"))
+        serial = clean_serial_number(read_text_file("/sys/class/dmi/id/product_serial"))
+        if not serial:
+            serial = clean_serial_number(read_text_file("/sys/class/dmi/id/board_serial"))
+
         inventory = {
+            "Computer name": socket.gethostname(),
+            "Current user": getpass.getuser(),
+            "OS": linux_command_lines(["uname", "-srmo"], limit=1),
+            "OS version": read_text_file("/etc/os-release").splitlines()[0].replace("PRETTY_NAME=", "").strip('"') if read_text_file("/etc/os-release") else "",
             "Product type": product_type,
             "Manufacturer": read_text_file("/sys/class/dmi/id/sys_vendor"),
             "Model": read_text_file("/sys/class/dmi/id/product_name"),
             "Chassis type": product_type,
             "Part number": read_text_file("/sys/class/dmi/id/product_sku"),
-            "Serial number": read_text_file("/sys/class/dmi/id/product_serial") or read_text_file("/sys/class/dmi/id/board_serial"),
+            "Serial number": serial,
+            "Motherboard": read_text_file("/sys/class/dmi/id/board_vendor") + " " + read_text_file("/sys/class/dmi/id/board_name"),
+            "BIOS version": read_text_file("/sys/class/dmi/id/bios_version"),
             "Processor": cpu,
             "RAM size": ram,
+            "RAM slots used": linux_ram_slots(),
             "Disk type": disk_type,
             "Disk size": disk_size,
+            "Disk details": linux_command_lines(["lsblk", "-o", "NAME,SIZE,TYPE,MODEL"], limit=10),
+            "Volumes": linux_command_lines(["df", "-h", "--output=source,size,used,avail,pcent,target"], limit=10),
             "Video model": video,
             "LCD type": infer_screen_type_from_text(linux_monitor_text()),
+            "Network adapters": linux_command_lines(["ip", "-brief", "addr"], limit=10),
         }
     else:
         inventory = {}
@@ -1568,7 +1851,7 @@ def register_client(args, include_manual_tests=False, include_auditor_tests=Fals
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Register this workstation with the Enterprise Desktop System network job server."
+        description="Register this workstation with the PC Audit network job server."
     )
     parser.add_argument("--server", default=DEFAULT_SERVER, help="Job server URL, e.g. http://192.168.1.50:8765")
     parser.add_argument("--name", default=DEFAULT_NAME, help="Client/workstation name shown in Available Clients")
@@ -1583,12 +1866,12 @@ def parse_args():
     parser.add_argument(
         "--auditor-tests",
         action="store_true",
-        help="Run full Aiken-like PC-Auditor-style tests for disks, ports, sound, LCD, keyboard, camera and input devices",
+        help="Run full PC Audit-style PC-Auditor-style tests for disks, ports, sound, LCD, keyboard, camera and input devices",
     )
     parser.add_argument(
-        "--aiken-tests",
+        "--pc-audit-tests",
         action="store_true",
-        help="Alias for --auditor-tests with the full Aiken-like device test suite",
+        help="Alias for --auditor-tests with the full PC Audit-style device test suite",
     )
     parser.add_argument(
         "--windows-device-tests",
@@ -1638,7 +1921,7 @@ def main():
 
     if args.print_diagnostics:
         diagnostics = collect_device_diagnostics()
-        if args.auditor_tests or args.aiken_tests:
+        if args.auditor_tests or args.pc_audit_tests:
             diagnostics = merge_diagnostics(diagnostics, collect_auditor_style_tests(args))
         if args.windows_device_tests:
             diagnostics = merge_diagnostics(diagnostics, collect_windows_device_tests(args))
@@ -1667,7 +1950,7 @@ def main():
                 print("Server requires manual tests. Starting manual checklist now.", flush=True)
                 include_manual_tests = True
 
-            include_auditor_tests = (args.auditor_tests or args.aiken_tests) and not auditor_tests_done_this_session
+            include_auditor_tests = (args.auditor_tests or args.pc_audit_tests) and not auditor_tests_done_this_session
             include_windows_tests = args.windows_device_tests and not windows_tests_done_this_session
             result = register_client(
                 args,

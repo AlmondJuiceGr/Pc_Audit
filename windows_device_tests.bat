@@ -17,6 +17,6 @@ if "%CLIENT_NAME%"=="" set "CLIENT_NAME=%COMPUTERNAME%"
 cd /d "%~dp0"
 set "EXTRA_ARGS="
 if "%RUN_BACKGROUND%"=="1" set "EXTRA_ARGS=--non-interactive-tests"
-python register_client.py --server "%SERVER_URL%" --name "%CLIENT_NAME%" --windows-device-tests --no-diagnostics %EXTRA_ARGS% --once
+py -3 register_client.py --server "%SERVER_URL%" --name "%CLIENT_NAME%" --windows-device-tests --no-diagnostics %EXTRA_ARGS% --once
 
 if not "%RUN_BACKGROUND%"=="1" pause

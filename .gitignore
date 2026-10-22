@@ -20,6 +20,14 @@ report_*.xlsx
 logs_*.xlsx
 backup_*.db
 app_backup_*.db
+audit_reports/
+print_reports/
 
 *.tmp
 *.bak
+
+# Local editor state and generated deployment artifacts
+.vs/
+pxe_wim_toolkit/build/
+pxe_wim_toolkit/drivers/host_export/
+pxe_wim_toolkit/portable_python/

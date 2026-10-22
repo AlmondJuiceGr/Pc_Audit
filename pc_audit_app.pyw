@@ -1,11 +1,15 @@
 import hashlib
+import getpass
+import html
 import json
 import locale
 import os
 import platform
+import re
 import subprocess
 import shutil
 import sqlite3
+import socket
 import threading
 import time
 import traceback
@@ -30,8 +34,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "app.db")
 INVENTORY_DEBUG_LOG = os.path.join(BASE_DIR, "inventory_debug.log")
 
-APP_TITLE = "AikenJobs Enterprise Dashboard"
-APP_VERSION = "2.0.0"
+APP_TITLE = "PC Audit Dashboard"
+APP_VERSION = "3.0.0"
+LEGACY_BRAND = "Enter" + "prise"
 
 # Professional color palette
 BG = "#0f172a"
@@ -54,46 +59,98 @@ DEFAULT_SETTINGS = {
     "auto_refresh": "1",
     "network_server_url": "http://127.0.0.1:8765",
     "workstation_name": os.environ.get("COMPUTERNAME", "CLIENT-1"),
+    "language": "el",
 }
 
+
+def load_saved_language():
+    if not os.path.exists(DB_NAME):
+        return DEFAULT_SETTINGS["language"]
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT value FROM app_settings WHERE key=?", ("language",))
+        row = c.fetchone()
+        conn.close()
+    except sqlite3.Error:
+        return DEFAULT_SETTINGS["language"]
+    return row[0] if row and row[0] in {"en", "el"} else DEFAULT_SETTINGS["language"]
+
+
+UI_LANGUAGE = load_saved_language()
+
+
+def tr(en, el):
+    return el if UI_LANGUAGE == "el" else en
+
 AUDITOR_FIELDS = [
+    "Computer name",
+    "Current user",
+    "OS",
+    "OS version",
+    "OS architecture",
+    "Domain / Workgroup",
     "Product type",
     "Manufacturer",
     "Model",
     "Chassis type",
     "Part number",
     "Serial number",
+    "Motherboard",
+    "BIOS version",
+    "Secure Boot",
+    "TPM",
     "Processor",
     "RAM size",
+    "RAM slots used",
     "Disk type",
     "Disk size",
+    "Disk details",
+    "Volumes",
     "Optical drive",
     "Video model",
     "LCD size",
     "LCD resolution",
     "LCD type",
     "Keyboard layout",
+    "Network adapters",
+    "Battery",
     "OS COA",
     "Grade",
 ]
 
 AUDITOR_SAMPLE_VALUES = {
+    "Computer name": "AUDIT-PC-001",
+    "Current user": "technician",
+    "OS": "Windows 11 Pro",
+    "OS version": "10.0.22631 build 22631",
+    "OS architecture": "64-bit",
+    "Domain / Workgroup": "Workgroup: WORKGROUP",
     "Product type": "LAPTOP",
     "Manufacturer": "HP",
     "Model": "ELITEBOOK 8540W",
     "Chassis type": "LAPTOP",
     "Part number": "NU515AV",
     "Serial number": "CND0511LHM",
+    "Motherboard": "HP 1521",
+    "BIOS version": "F.60",
+    "Secure Boot": "True",
+    "TPM": "Present=True; Ready=True; Enabled=True",
     "Processor": "Intel Core i5 M 540 2.53 GHz",
     "RAM size": "2 GB",
+    "RAM slots used": "1 / 2",
     "Disk type": "SATA SSD",
     "Disk size": "180 GB",
+    "Disk details": "Samsung SSD | SATA | SSD | 180 GB",
+    "Volumes": "C: 180 GB free 90 GB",
     "Optical drive": "DVD/RW",
     "Video model": "NVIDIA QUADRO FX 880M",
     "LCD size": "15.5\"",
     "LCD resolution": "1600x900",
     "LCD type": "Unknown",
     "Keyboard layout": "",
+    "Network adapters": "Intel Ethernet | MAC 00:11:22:33:44:55 | IP 192.168.1.20",
+    "Battery": "Primary Battery | 87% | status 2",
     "OS COA": "",
     "Grade": "",
 }
@@ -127,6 +184,7 @@ OS_COA_OPTIONS = [
 ]
 
 FIELD_COUNT = len(AUDITOR_FIELDS)
+SERIAL_NUMBER_INDEX = AUDITOR_FIELDS.index("Serial number")
 LCD_TYPE_INDEX = AUDITOR_FIELDS.index("LCD type")
 KEYBOARD_SKIP_FIELDS = {"LCD type"}
 RECORD_SELECT_COLUMNS = "id, xenoglossi, timestamp, username, password, dropdown, checkbox, inputs"
@@ -143,6 +201,11 @@ def hash_password(pw):
     return hashlib.sha256(pw.encode("utf-8")).hexdigest()
 
 
+def remove_legacy_brand_word(value):
+    cleaned = str(value or "").replace(LEGACY_BRAND, "").replace(LEGACY_BRAND.lower(), "")
+    return " ".join(cleaned.split())
+
+
 def init_db():
     conn = get_conn()
     c = conn.cursor()
@@ -152,7 +215,6 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             xenoglossi TEXT NOT NULL DEFAULT '',
             timestamp TEXT,
-            username TEXT,
             username TEXT,
             password TEXT,
             dropdown TEXT,
@@ -212,6 +274,13 @@ def init_db():
             "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
             (key, value),
         )
+
+    c.execute("SELECT value FROM app_settings WHERE key=?", ("system_name",))
+    row = c.fetchone()
+    if row:
+        cleaned_system_name = remove_legacy_brand_word(row[0]) or APP_TITLE
+        if cleaned_system_name != row[0]:
+            c.execute("UPDATE app_settings SET value=? WHERE key=?", (cleaned_system_name, "system_name"))
 
     conn.commit()
     conn.close()
@@ -380,8 +449,10 @@ current_user = None
 current_role = None
 selected_id = None
 selected_user_id = None
+pc_audit_batch_started = False
 network_jobs = {}
 network_clients = {}
+audit_archive_records = {}
 
 
 # =========================
@@ -416,7 +487,8 @@ def create_scrollable_area(parent, bg=BG):
 
     scrollable_frame.bind("<Configure>", update_scrollregion)
     canvas.bind("<Configure>", resize_inner_frame)
-    canvas.bind_all("<MouseWheel>", on_mousewheel)
+    canvas.bind("<Enter>", lambda event: canvas.bind_all("<MouseWheel>", on_mousewheel))
+    canvas.bind("<Leave>", lambda event: canvas.unbind_all("<MouseWheel>"))
 
     canvas.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
 
@@ -463,8 +535,29 @@ def normalize_input_values(values):
 
 
 def set_protected_tabs(state):
+    if "login_frame" in globals():
+        notebook.tab(login_frame, state="normal")
+
     for tab_index in range(1, notebook.index("end")):
         notebook.tab(tab_index, state=state)
+
+    if state == "hidden":
+        return
+
+    if current_role == "User":
+        hidden_for_user = [
+            login_frame,
+            db_frame,
+            analytics_frame,
+            network_frame,
+            users_frame,
+            logs_frame,
+        ]
+        for frame in hidden_for_user:
+            notebook.tab(frame, state="hidden")
+
+    if state == "normal" and current_role != "Admin" and "reports_frame" in globals():
+        notebook.tab(reports_frame, state="hidden")
 
 
 def require_login():
@@ -519,6 +612,162 @@ def refresh_all_data():
     load_logs()
 
 
+def language_label(code):
+    return "Ελληνικά" if code == "el" else "English"
+
+
+def language_code(label):
+    return "el" if str(label).strip().lower().startswith("ε") else "en"
+
+
+UI_TRANSLATIONS = {
+    "Login": "Σύνδεση",
+    "Records": "Εγγραφές",
+    "Database": "Βάση Δεδομένων",
+    "Analytics": "Στατιστικά",
+    "Reports": "Αναφορές",
+    "Network Jobs": "Δικτυακές Εργασίες",
+    "Device Results": "Αποτελέσματα Συσκευών",
+    "Audit Archive": "Αρχείο Audit",
+    "Manual Tests": "Χειροκίνητοι Έλεγχοι",
+    "Users": "Χρήστες",
+    "Settings": "Ρυθμίσεις",
+    "Logs": "Αρχεία Καταγραφής",
+    "Record Form": "Φόρμα Εγγραφής",
+    "Create or update database records": "Δημιουργία ή ενημέρωση εγγραφών",
+    "Record Username": "Χρήστης Εγγραφής",
+    "Record Password": "Κωδικός Εγγραφής",
+    "Leave password blank while editing to keep the stored password.": "Αφήστε κενό τον κωδικό στην επεξεργασία για να μείνει ο αποθηκευμένος.",
+    "Option": "Επιλογή",
+    "Accept Terms": "Αποδοχή όρων",
+    "Tab empty fields": "Tab σε κενά πεδία",
+    "Load PC Auditor Example": "Φόρτωση Παραδείγματος",
+    "Read This PC": "Ανάγνωση αυτού του PC",
+    "Database Records": "Εγγραφές Βάσης",
+    "Search, select, update, delete and export records": "Αναζήτηση, επιλογή, ενημέρωση, διαγραφή και εξαγωγή εγγραφών",
+    "Search": "Αναζήτηση",
+    "Refresh": "Ανανέωση",
+    "Build filtered reports and export the exact result set": "Δημιουργία φιλτραρισμένων αναφορών και εξαγωγή αποτελεσμάτων",
+    "Build Report": "Δημιουργία Αναφοράς",
+    "Export Excel": "Εξαγωγή Excel",
+    "Export JSON": "Εξαγωγή JSON",
+    "Network Jobs": "Δικτυακές Εργασίες",
+    "Share PC Auditor jobs through the network and execute them locally on each client": "Μοίρασμα εργασιών PC Auditor στο δίκτυο και εκτέλεση τοπικά σε κάθε client",
+    "Connection": "Σύνδεση",
+    "Server URL": "URL Server",
+    "This Client": "Αυτός ο Client",
+    "Status": "Κατάσταση",
+    "Save": "Αποθήκευση",
+    "Test": "Δοκιμή",
+    "Available Clients": "Διαθέσιμοι Clients",
+    "Register This Client": "Εγγραφή αυτού του Client",
+    "Refresh Clients": "Ανανέωση Clients",
+    "Load Client Info To Form": "Φόρτωση Client στη Φόρμα",
+    "Select a row to use it as the publish assignee.": "Επιλέξτε γραμμή για ανάθεση δημοσίευσης.",
+    "Publish Current Form": "Δημοσίευση Τρέχουσας Φόρμας",
+    "Job Title": "Τίτλος Εργασίας",
+    "Assignee": "Ανάθεση",
+    "Publish Job": "Δημοσίευση Εργασίας",
+    "Fetch Jobs": "Λήψη Εργασιών",
+    "Load Selected To Form": "Φόρτωση Επιλεγμένου στη Φόρμα",
+    "Apply Selected": "Εφαρμογή Επιλεγμένου",
+    "Mark Completed": "Σήμανση Ολοκληρωμένου",
+    "Mark Failed": "Σήμανση Αποτυχίας",
+    "Selected Job": "Επιλεγμένη Εργασία",
+    "Remote client hardware diagnostics reported by the registration heartbeat": "Διαγνωστικά hardware από απομακρυσμένους clients",
+    "Refresh Results": "Ανανέωση Αποτελεσμάτων",
+    "Apply Filter": "Εφαρμογή Φίλτρου",
+    "Selected Result": "Επιλεγμένο Αποτέλεσμα",
+    "Historical PC audit snapshots from every registered network client": "Ιστορικά snapshots audit από κάθε δικτυακό client",
+    "Refresh Archive": "Ανανέωση Αρχείου",
+    "Client:": "Client:",
+    "Limit:": "Όριο:",
+    "Load To Form": "Φόρτωση στη Φόρμα",
+    "Print HTML": "Εκτύπωση HTML",
+    "Selected Audit": "Επιλεγμένο Audit",
+    "All technician and auditor-style device/port checks in one view": "Όλοι οι τεχνικοί έλεγχοι συσκευών/θυρών σε μία προβολή",
+    "Refresh Manual Tests": "Ανανέωση Χειροκίνητων Ελέγχων",
+    "Manual tests required": "Απαιτούνται χειροκίνητοι έλεγχοι",
+    "Save Requirement": "Αποθήκευση Απαίτησης",
+    "Load Requirement": "Φόρτωση Απαίτησης",
+    "Run Windows Tests": "Εκτέλεση Windows Tests",
+    "Manage application users, roles and account status": "Διαχείριση χρηστών, ρόλων και κατάστασης λογαριασμών",
+    "Username": "Χρήστης",
+    "Password": "Κωδικός",
+    "Role": "Ρόλος",
+    "Active": "Ενεργός",
+    "Add User": "Προσθήκη Χρήστη",
+    "Update": "Ενημέρωση",
+    "Clear": "Καθαρισμός",
+    "Delete": "Διαγραφή",
+    "Configure application preferences and database maintenance": "Ρυθμίσεις εφαρμογής και συντήρηση βάσης",
+    "Application Settings": "Ρυθμίσεις Εφαρμογής",
+    "System Name": "Όνομα Συστήματος",
+    "Export Folder": "Φάκελος Εξαγωγών",
+    "Keyboard Delay (ms)": "Καθυστέρηση Πληκτρολογίου (ms)",
+    "Auto refresh dashboards after changes": "Αυτόματη ανανέωση μετά από αλλαγές",
+    "Save Settings": "Αποθήκευση Ρυθμίσεων",
+    "Reset Defaults": "Επαναφορά Προεπιλογών",
+    "Windows License": "Άδεια Windows",
+    "Edition": "Έκδοση",
+    "Product Name": "Όνομα Προϊόντος",
+    "Product Key": "Κλειδί Προϊόντος",
+    "Channel": "Κανάλι",
+    "Read Windows License": "Ανάγνωση Άδειας Windows",
+    "Digital licenses may not expose a full product key.": "Οι ψηφιακές άδειες μπορεί να μην εμφανίζουν πλήρες product key.",
+    "Database Maintenance": "Συντήρηση Βάσης",
+    "Backup Database": "Backup Βάσης",
+    "Batch Launcher": "Εκκίνηση Batch",
+    "Refresh Batch Files": "Ανανέωση Batch Αρχείων",
+    "Run Selected Background": "Εκτέλεση Επιλεγμένων στο Background",
+    "Run All Background": "Εκτέλεση Όλων στο Background",
+    "Audit trail for sessions, records, exports and administration": "Ιστορικό συνεδριών, εγγραφών, εξαγωγών και διαχείρισης",
+    "User:": "Χρήστης:",
+    "Action:": "Ενέργεια:",
+    "Clear Logs": "Καθαρισμός Logs",
+    "New / Clear": "Νέα / Καθαρισμός",
+    "Save / Update": "Αποθήκευση / Ενημέρωση",
+    "Apply Keys (F1)": "Εφαρμογή Πλήκτρων (F1)",
+    "Logout": "Αποσύνδεση",
+    "Internal administration dashboard": "Πίνακας διαχείρισης",
+    "Status: Logged out": "Κατάσταση: Αποσυνδεδεμένος",
+    "Demo credentials: admin / 1234": "Στοιχεία δοκιμής: admin / 1234",
+}
+
+
+def ui_text(value):
+    if UI_LANGUAGE != "el":
+        return value
+    return UI_TRANSLATIONS.get(value, value)
+
+
+def apply_ui_language(widget):
+    if UI_LANGUAGE != "el":
+        return
+    try:
+        text = widget.cget("text")
+        translated = ui_text(text)
+        if translated != text:
+            widget.configure(text=translated)
+    except tk.TclError:
+        pass
+    if isinstance(widget, ttk.Notebook):
+        for tab_id in widget.tabs():
+            text = widget.tab(tab_id, "text")
+            widget.tab(tab_id, text=ui_text(text))
+    if isinstance(widget, ttk.Treeview):
+        for column in ("#0",) + tuple(widget["columns"]):
+            try:
+                text = widget.heading(column).get("text", "")
+                translated = ui_text(text)
+                if translated != text:
+                    widget.heading(column, text=translated)
+            except tk.TclError:
+                pass
+    for child in widget.winfo_children():
+        apply_ui_language(child)
+
+
 # =========================
 # MAIN LAYOUT
 # =========================
@@ -530,19 +779,16 @@ left_header.pack(side="left")
 
 title_label = ttk.Label(left_header, text=APP_TITLE, style="Header.TLabel")
 title_label.pack(anchor="w")
-ttk.Label(left_header, text="Internal administration dashboard", style="SubHeader.TLabel").pack(anchor="w")
+ttk.Label(left_header, text=tr("Internal administration dashboard", "Πίνακας διαχείρισης"), style="SubHeader.TLabel").pack(anchor="w")
 
 right_header = tk.Frame(header, bg=BG)
 right_header.pack(side="right")
 
-session_label = ttk.Label(right_header, text="Status: Logged out", style="Muted.TLabel")
+session_label = ttk.Label(right_header, text=tr("Status: Logged out", "Κατάσταση: Αποσυνδεδεμένος"), style="Muted.TLabel")
 session_label.pack(side="left", padx=10)
 
-logout_btn = ttk.Button(right_header, text="Logout", command=lambda: logout(), style="Danger.TButton")
-
-action_bar = tk.Frame(root, bg="#020617", height=58, highlightbackground=BORDER, highlightthickness=1)
-action_bar.pack(fill="x", padx=18, pady=(0, 10))
-action_bar.pack_propagate(False)
+logout_btn = ttk.Button(right_header, text=tr("Logout", "Αποσύνδεση"), command=lambda: logout(), style="Danger.TButton")
+ttk.Label(right_header, text=f"Version {APP_VERSION}", style="Muted.TLabel").pack(side="left", padx=5)
 
 notebook = ttk.Notebook(root)
 notebook.pack(fill="both", expand=True, padx=18, pady=8)
@@ -616,7 +862,7 @@ def logout():
 # LOGIN TAB
 # =========================
 login_frame = tk.Frame(notebook, bg=BG)
-notebook.add(login_frame, text="Login")
+notebook.add(login_frame, text=tr("Login", "Σύνδεση"))
 
 login_card = make_card(login_frame, "Secure Login")
 login_card.pack(expand=True)
@@ -624,16 +870,16 @@ login_card.pack(expand=True)
 login_body = tk.Frame(login_card, bg=CARD)
 login_body.pack(padx=34, pady=(8, 30))
 
-ttk.Label(login_body, text="Username", style="Card.TLabel").grid(row=0, column=0, sticky="e", padx=12, pady=8)
+ttk.Label(login_body, text=tr("Username", "Χρήστης"), style="Card.TLabel").grid(row=0, column=0, sticky="e", padx=12, pady=8)
 login_username_entry = ttk.Entry(login_body, width=34)
 login_username_entry.grid(row=0, column=1, pady=8)
 
-ttk.Label(login_body, text="Password", style="Card.TLabel").grid(row=1, column=0, sticky="e", padx=12, pady=8)
+ttk.Label(login_body, text=tr("Password", "Κωδικός"), style="Card.TLabel").grid(row=1, column=0, sticky="e", padx=12, pady=8)
 login_password_entry = ttk.Entry(login_body, show="*", width=34)
 login_password_entry.grid(row=1, column=1, pady=8)
 
-ttk.Button(login_body, text="Login", command=do_login, style="Success.TButton").grid(row=2, column=0, columnspan=2, pady=18)
-ttk.Label(login_body, text="Demo credentials: admin / 1234", style="Card.TLabel").grid(row=3, column=0, columnspan=2)
+ttk.Button(login_body, text=tr("Login", "Σύνδεση"), command=do_login, style="Success.TButton").grid(row=2, column=0, columnspan=2, pady=18)
+ttk.Label(login_body, text=tr("Demo credentials: admin / 1234", "Στοιχεία δοκιμής: admin / 1234"), style="Card.TLabel").grid(row=3, column=0, columnspan=2)
 
 login_password_entry.bind("<Return>", lambda event: do_login())
 
@@ -642,15 +888,15 @@ login_password_entry.bind("<Return>", lambda event: do_login())
 # FORM TAB
 # =========================
 form_frame = tk.Frame(notebook, bg=BG)
-notebook.add(form_frame, text="Records", state="hidden")
+notebook.add(form_frame, text=tr("Records", "Εγγραφές"), state="hidden")
 
 form_scroll = create_scrollable_area(form_frame, bg=BG)
 
 form_header = tk.Frame(form_scroll, bg=BG)
 form_header.pack(fill="x", padx=10, pady=(12, 4))
 
-ttk.Label(form_header, text="Record Form", style="Header.TLabel").pack(anchor="w")
-ttk.Label(form_header, text="Create or update database records", style="SubHeader.TLabel").pack(anchor="w")
+ttk.Label(form_header, text=tr("Record Form", "Φόρμα Εγγραφής"), style="Header.TLabel").pack(anchor="w")
+ttk.Label(form_header, text=tr("Create or update database records", "Δημιουργία ή ενημέρωση εγγραφών"), style="SubHeader.TLabel").pack(anchor="w")
 
 form_card = make_card(form_scroll, "Data Entry")
 form_card.pack(fill="x", padx=10, pady=10)
@@ -658,19 +904,19 @@ form_card.pack(fill="x", padx=10, pady=10)
 identity_container = tk.Frame(form_card, bg=CARD)
 identity_container.pack(padx=24, pady=(8, 8), fill="x")
 
-ttk.Label(identity_container, text="Ξενόγλωσση", style="Card.TLabel").grid(
+ttk.Label(identity_container, text="Asset Tag", style="Card.TLabel").grid(
     row=0, column=0, sticky="e", padx=(8, 10), pady=7
 )
 record_xenoglossi_entry = ttk.Entry(identity_container, width=34)
 record_xenoglossi_entry.grid(row=0, column=1, sticky="ew", padx=(0, 28), pady=7)
 
-ttk.Label(identity_container, text="Record Username", style="Card.TLabel").grid(
+ttk.Label(identity_container, text=tr("Record Username", "Χρήστης Εγγραφής"), style="Card.TLabel").grid(
     row=0, column=2, sticky="e", padx=(8, 10), pady=7
 )
 record_username_entry = ttk.Entry(identity_container, width=34)
 record_username_entry.grid(row=0, column=3, sticky="ew", padx=(0, 28), pady=7)
 
-ttk.Label(identity_container, text="Record Password", style="Card.TLabel").grid(
+ttk.Label(identity_container, text=tr("Record Password", "Κωδικός Εγγραφής"), style="Card.TLabel").grid(
     row=1, column=0, sticky="e", padx=(8, 10), pady=7
 )
 record_password_entry = ttk.Entry(identity_container, show="*", width=34)
@@ -678,7 +924,7 @@ record_password_entry.grid(row=1, column=1, sticky="ew", padx=(0, 28), pady=7)
 
 ttk.Label(
     identity_container,
-    text="Leave password blank while editing to keep the stored password.",
+    text=tr("Leave password blank while editing to keep the stored password.", "Αφήστε κενό τον κωδικό στην επεξεργασία για να μείνει ο αποθηκευμένος."),
     style="Card.TLabel",
 ).grid(row=1, column=3, sticky="w", pady=(0, 7))
 
@@ -691,8 +937,8 @@ form_container.pack(padx=24, pady=(8, 22), fill="x")
 entries = []
 
 for i, field_name in enumerate(AUDITOR_FIELDS):
-    row = i % 10
-    col_block = i // 10
+    row = i % 16
+    col_block = i // 16
     label_col = col_block * 2
     entry_col = label_col + 1
 
@@ -709,18 +955,18 @@ for i, field_name in enumerate(AUDITOR_FIELDS):
     e.grid(row=row, column=entry_col, sticky="ew", padx=(0, 28), pady=7)
     entries.append(e)
 
-form_container.columnconfigure(1, weight=1)
-form_container.columnconfigure(3, weight=1)
+for col in range(1, ((len(AUDITOR_FIELDS) + 15) // 16) * 2, 2):
+    form_container.columnconfigure(col, weight=1)
 
 options_row = tk.Frame(form_card, bg=CARD)
 options_row.pack(fill="x", padx=24, pady=(0, 22))
 
-ttk.Label(options_row, text="Option", style="Card.TLabel").pack(side="left", padx=(8, 10))
+ttk.Label(options_row, text=tr("Option", "Επιλογή"), style="Card.TLabel").pack(side="left", padx=(8, 10))
 dropdown = ttk.Combobox(options_row, values=[f"Option {i}" for i in range(1, 11)], width=28, state="readonly")
 dropdown.pack(side="left", padx=(0, 25))
 
 checkbox_var = tk.BooleanVar()
-ttk.Checkbutton(options_row, text="Accept Terms", variable=checkbox_var, style="Card.TCheckbutton").pack(side="left")
+ttk.Checkbutton(options_row, text=tr("Accept Terms", "Αποδοχή όρων"), variable=checkbox_var, style="Card.TCheckbutton").pack(side="left")
 
 tab_empty_var = tk.BooleanVar(value=True)
 ttk.Checkbutton(
@@ -732,15 +978,56 @@ ttk.Checkbutton(
 
 ttk.Button(
     options_row,
-    text="Load PC Auditor Example",
+    text=tr("Load PC Auditor Example", "Φόρτωση Παραδείγματος"),
     command=lambda: load_auditor_sample(),
 ).pack(side="left", padx=(18, 0))
 
 ttk.Button(
     options_row,
-    text="Read This PC",
+    text=tr("Read This PC", "Ανάγνωση αυτού του PC"),
     command=lambda: start_read_current_pc_info(),
 ).pack(side="left", padx=(12, 0))
+
+record_actions_row = tk.Frame(form_card, bg=CARD)
+record_actions_row.pack(fill="x", padx=24, pady=(0, 22))
+
+ttk.Button(
+    record_actions_row,
+    text="New / Clear",
+    command=lambda: clear_form(),
+).pack(side="left", padx=(8, 6), pady=4)
+ttk.Button(
+    record_actions_row,
+    text="Save / Update",
+    command=lambda: submit(),
+    style="Success.TButton",
+).pack(side="left", padx=6, pady=4)
+ttk.Button(
+    record_actions_row,
+    text="Delete",
+    command=lambda: delete(),
+    style="Danger.TButton",
+).pack(side="left", padx=6, pady=4)
+ttk.Button(
+    record_actions_row,
+    text="Export Excel",
+    command=lambda: export_excel(),
+).pack(side="left", padx=6, pady=4)
+ttk.Button(
+    record_actions_row,
+    text="Export JSON",
+    command=lambda: export_json(),
+).pack(side="left", padx=6, pady=4)
+ttk.Button(
+    record_actions_row,
+    text="Apply Keys (F1)",
+    command=lambda: apply_keyboard_actions(),
+).pack(side="left", padx=6, pady=4)
+ttk.Button(
+    record_actions_row,
+    text="Run PC Audit",
+    command=lambda: run_pc_audit_batch(),
+).pack(side="left", padx=6, pady=4)
 
 
 # =========================
@@ -759,13 +1046,13 @@ toolbar = tk.Frame(db_frame, bg=BG)
 toolbar.pack(fill="x", padx=10, pady=8)
 
 search_var = tk.StringVar()
-ttk.Label(toolbar, text="Search username / Ξενόγλωσση:").pack(side="left")
+ttk.Label(toolbar, text="Search username / Asset Tag:").pack(side="left")
 search_entry = ttk.Entry(toolbar, textvariable=search_var, width=30)
 search_entry.pack(side="left", padx=8)
 ttk.Button(toolbar, text="Search", command=lambda: load_data(search_var.get())).pack(side="left", padx=4)
 ttk.Button(toolbar, text="Refresh", command=lambda: load_data()).pack(side="left", padx=4)
 
-columns = ("RecordID", "Ξενόγλωσση", "Timestamp", "Username", "Dropdown", "Accepted")
+columns = ("RecordID", "Asset Tag", "Timestamp", "Username", "Dropdown", "Accepted")
 tree_container = tk.Frame(db_frame, bg=BG)
 tree_container.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -777,7 +1064,7 @@ tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.se
 for col in columns:
     tree.heading(col, text=col)
     tree.column(col, anchor="center", width=160, stretch=True)
-tree.configure(displaycolumns=("Ξενόγλωσση", "Timestamp", "Username", "Dropdown", "Accepted"))
+tree.configure(displaycolumns=("Asset Tag", "Timestamp", "Username", "Dropdown", "Accepted"))
 
 tree.grid(row=0, column=0, sticky="nsew")
 tree_scroll_y.grid(row=0, column=1, sticky="ns")
@@ -864,13 +1151,16 @@ report_filters = tk.Frame(report_filter_card, bg=CARD)
 report_filters.pack(fill="x", padx=24, pady=(8, 20))
 
 report_username_var = tk.StringVar()
+report_asset_tag_var = tk.StringVar()
 report_option_var = tk.StringVar()
 report_from_var = tk.StringVar()
 report_to_var = tk.StringVar()
 
 ttk.Label(report_filters, text="Username", style="Card.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=6)
 ttk.Entry(report_filters, textvariable=report_username_var, width=24).grid(row=0, column=1, sticky="ew", padx=(0, 18), pady=6)
-ttk.Label(report_filters, text="Option", style="Card.TLabel").grid(row=0, column=2, sticky="e", padx=(0, 8), pady=6)
+ttk.Label(report_filters, text="Asset Tag", style="Card.TLabel").grid(row=0, column=2, sticky="e", padx=(0, 8), pady=6)
+ttk.Entry(report_filters, textvariable=report_asset_tag_var, width=24).grid(row=0, column=3, sticky="ew", padx=(0, 18), pady=6)
+ttk.Label(report_filters, text="Option", style="Card.TLabel").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=6)
 report_option_combo = ttk.Combobox(
     report_filters,
     textvariable=report_option_var,
@@ -878,11 +1168,11 @@ report_option_combo = ttk.Combobox(
     width=22,
     state="readonly",
 )
-report_option_combo.grid(row=0, column=3, sticky="ew", padx=(0, 18), pady=6)
-ttk.Label(report_filters, text="From", style="Card.TLabel").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=6)
-ttk.Entry(report_filters, textvariable=report_from_var, width=24).grid(row=1, column=1, sticky="ew", padx=(0, 18), pady=6)
-ttk.Label(report_filters, text="To", style="Card.TLabel").grid(row=1, column=2, sticky="e", padx=(0, 8), pady=6)
-ttk.Entry(report_filters, textvariable=report_to_var, width=24).grid(row=1, column=3, sticky="ew", padx=(0, 18), pady=6)
+report_option_combo.grid(row=1, column=1, sticky="ew", padx=(0, 18), pady=6)
+ttk.Label(report_filters, text="From", style="Card.TLabel").grid(row=1, column=2, sticky="e", padx=(0, 8), pady=6)
+ttk.Entry(report_filters, textvariable=report_from_var, width=24).grid(row=1, column=3, sticky="ew", padx=(0, 18), pady=6)
+ttk.Label(report_filters, text="To", style="Card.TLabel").grid(row=2, column=0, sticky="e", padx=(0, 8), pady=6)
+ttk.Entry(report_filters, textvariable=report_to_var, width=24).grid(row=2, column=1, sticky="ew", padx=(0, 18), pady=6)
 ttk.Button(report_filters, text="Build Report", command=lambda: build_report()).grid(row=0, column=4, padx=4, pady=6)
 ttk.Button(report_filters, text="Export Excel", command=lambda: export_report_excel()).grid(row=1, column=4, padx=4, pady=6)
 
@@ -895,7 +1185,7 @@ ttk.Label(reports_content, textvariable=report_summary_var, style="SubHeader.TLa
 report_tree_container = tk.Frame(reports_content, bg=BG)
 report_tree_container.pack(fill="both", expand=True)
 
-report_columns = ("Ξενόγλωσση", "Timestamp", "Username", "Dropdown", "Accepted", "Filled Inputs")
+report_columns = ("Asset Tag", "Timestamp", "Username", "Dropdown", "Accepted", "Filled Inputs")
 report_tree = ttk.Treeview(report_tree_container, columns=report_columns, show="headings")
 report_y = ttk.Scrollbar(report_tree_container, orient="vertical", command=report_tree.yview)
 report_x = ttk.Scrollbar(report_tree_container, orient="horizontal", command=report_tree.xview)
@@ -918,7 +1208,8 @@ report_tree_container.columnconfigure(0, weight=1)
 network_frame = tk.Frame(notebook, bg=BG)
 notebook.add(network_frame, text="Network Jobs", state="hidden")
 
-network_content = tk.Frame(network_frame, bg=BG)
+network_scroll = create_scrollable_area(network_frame, bg=BG)
+network_content = tk.Frame(network_scroll, bg=BG)
 network_content.pack(fill="both", expand=True, padx=24, pady=24)
 
 ttk.Label(network_content, text="Network Jobs", style="Header.TLabel").pack(anchor="w")
@@ -991,19 +1282,23 @@ ttk.Label(
     style="Card.TLabel",
 ).pack(side="left", padx=12)
 
-network_client_columns = ("Name", "User", "Role", "Last Seen", "Platform", "App")
+network_client_columns = ("Name", "IP", "MAC", "User", "Role", "Last Seen", "Platform", "App")
 network_client_tree = ttk.Treeview(network_clients_body, columns=network_client_columns, show="headings", height=5)
 client_y = ttk.Scrollbar(network_clients_body, orient="vertical", command=network_client_tree.yview)
-network_client_tree.configure(yscrollcommand=client_y.set)
+client_x = ttk.Scrollbar(network_clients_body, orient="horizontal", command=network_client_tree.xview)
+network_client_tree.configure(yscrollcommand=client_y.set, xscrollcommand=client_x.set)
 
 for col in network_client_columns:
     network_client_tree.heading(col, text=col)
     network_client_tree.column(col, anchor="center", width=140, stretch=True)
 network_client_tree.column("Name", width=180)
+network_client_tree.column("IP", width=130)
+network_client_tree.column("MAC", width=150)
 network_client_tree.column("Platform", width=180)
 
-network_client_tree.pack(side="left", fill="x", expand=True)
+network_client_tree.pack(side="left", fill="both", expand=True)
 client_y.pack(side="left", fill="y")
+client_x.pack(fill="x")
 
 network_publish_card = make_card(network_content, "Publish Current Form")
 network_publish_card.pack(fill="x", pady=(0, 14))
@@ -1151,6 +1446,80 @@ device_details_text.configure(state="disabled")
 
 
 # =========================
+# AUDIT ARCHIVE TAB
+# =========================
+audit_archive_frame = tk.Frame(notebook, bg=BG)
+notebook.add(audit_archive_frame, text="Audit Archive", state="hidden")
+
+audit_archive_content = tk.Frame(audit_archive_frame, bg=BG)
+audit_archive_content.pack(fill="both", expand=True, padx=24, pady=24)
+
+ttk.Label(audit_archive_content, text="Audit Archive", style="Header.TLabel").pack(anchor="w")
+ttk.Label(
+    audit_archive_content,
+    text="Historical PC audit snapshots from every registered network client",
+    style="SubHeader.TLabel",
+).pack(anchor="w", pady=(0, 18))
+
+audit_archive_toolbar = tk.Frame(audit_archive_content, bg=BG)
+audit_archive_toolbar.pack(fill="x", pady=(0, 10))
+
+audit_archive_client_var = tk.StringVar()
+audit_archive_limit_var = tk.StringVar(value="500")
+ttk.Button(audit_archive_toolbar, text="Refresh Archive", command=lambda: fetch_audit_archive()).pack(side="left", padx=(0, 6))
+ttk.Label(audit_archive_toolbar, text="Client:").pack(side="left", padx=(12, 6))
+audit_archive_client_combo = ttk.Combobox(audit_archive_toolbar, textvariable=audit_archive_client_var, values=[""], width=24)
+audit_archive_client_combo.pack(side="left", padx=(0, 8))
+ttk.Label(audit_archive_toolbar, text="Limit:").pack(side="left", padx=(12, 6))
+ttk.Entry(audit_archive_toolbar, textvariable=audit_archive_limit_var, width=8).pack(side="left", padx=(0, 8))
+ttk.Button(audit_archive_toolbar, text="Load To Form", command=lambda: load_selected_audit_to_form()).pack(side="left", padx=6)
+ttk.Button(audit_archive_toolbar, text="Print HTML", command=lambda: print_audit_archive_html()).pack(side="left", padx=6)
+
+audit_archive_summary_var = tk.StringVar(value="No audit history loaded")
+ttk.Label(audit_archive_content, textvariable=audit_archive_summary_var, style="SubHeader.TLabel").pack(anchor="w", pady=(0, 8))
+
+audit_archive_body = tk.Frame(audit_archive_content, bg=BG)
+audit_archive_body.pack(fill="both", expand=True)
+
+audit_archive_tree_container = tk.Frame(audit_archive_body, bg=BG)
+audit_archive_tree_container.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+audit_archive_columns = ("ID", "Client", "Created At", "Platform", "OK", "WARN", "FAIL", "UNKNOWN")
+audit_archive_tree = ttk.Treeview(audit_archive_tree_container, columns=audit_archive_columns, show="headings")
+audit_archive_y = ttk.Scrollbar(audit_archive_tree_container, orient="vertical", command=audit_archive_tree.yview)
+audit_archive_x = ttk.Scrollbar(audit_archive_tree_container, orient="horizontal", command=audit_archive_tree.xview)
+audit_archive_tree.configure(yscrollcommand=audit_archive_y.set, xscrollcommand=audit_archive_x.set)
+
+for col in audit_archive_columns:
+    audit_archive_tree.heading(col, text=col)
+    audit_archive_tree.column(col, anchor="center", width=115, stretch=True)
+audit_archive_tree.column("Client", width=180)
+audit_archive_tree.column("Created At", width=160)
+audit_archive_tree.column("Platform", width=220)
+
+audit_archive_tree.grid(row=0, column=0, sticky="nsew")
+audit_archive_y.grid(row=0, column=1, sticky="ns")
+audit_archive_x.grid(row=1, column=0, sticky="ew")
+audit_archive_tree_container.rowconfigure(0, weight=1)
+audit_archive_tree_container.columnconfigure(0, weight=1)
+
+audit_archive_details_card = make_card(audit_archive_body, "Selected Audit")
+audit_archive_details_card.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+audit_archive_details_text = tk.Text(
+    audit_archive_details_card,
+    bg=ENTRY_BG,
+    fg=TEXT,
+    insertbackground=TEXT,
+    relief="flat",
+    height=12,
+    wrap="word",
+)
+audit_archive_details_text.pack(fill="both", expand=True, padx=18, pady=(8, 18))
+audit_archive_details_text.configure(state="disabled")
+
+
+# =========================
 # MANUAL TESTS TAB
 # =========================
 manual_tests_frame = tk.Frame(notebook, bg=BG)
@@ -1174,6 +1543,12 @@ manual_required_var = tk.BooleanVar(value=False)
 manual_windows_usb_expected_var = tk.StringVar()
 manual_windows_optical_path_var = tk.StringVar()
 manual_windows_usb_path_var = tk.StringVar()
+manual_windows_usb_ports_var = tk.BooleanVar(value=True)
+manual_windows_fast_usb_var = tk.BooleanVar(value=True)
+manual_windows_optical_var = tk.BooleanVar(value=True)
+manual_windows_removable_var = tk.BooleanVar(value=True)
+manual_windows_sound_var = tk.BooleanVar(value=True)
+manual_windows_upload_var = tk.BooleanVar(value=True)
 manual_windows_test_status_var = tk.StringVar(value="Windows device tests not run")
 ttk.Button(manual_tests_toolbar, text="Refresh Manual Tests", command=lambda: refresh_manual_tests()).pack(side="left", padx=(0, 6))
 ttk.Label(manual_tests_toolbar, text="Status:").pack(side="left", padx=(12, 6))
@@ -1209,16 +1584,31 @@ ttk.Label(manual_windows_body, text="USB/SD path", style="Card.TLabel").grid(row
 ttk.Entry(manual_windows_body, textvariable=manual_windows_usb_path_var, width=18).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=6)
 ttk.Button(manual_windows_body, text="Browse", command=lambda: browse_manual_test_path(manual_windows_usb_path_var)).grid(row=1, column=2, sticky="w", padx=(0, 18), pady=6)
 ttk.Button(manual_windows_body, text="Detect Paths", command=lambda: detect_windows_test_paths()).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=6)
+
+manual_windows_options = tk.Frame(manual_windows_body, bg=CARD)
+manual_windows_options.grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 6))
+ttk.Checkbutton(manual_windows_options, text="USB ports", variable=manual_windows_usb_ports_var, style="Card.TCheckbutton").pack(side="left", padx=(0, 12))
+ttk.Checkbutton(manual_windows_options, text="Fast USB", variable=manual_windows_fast_usb_var, style="Card.TCheckbutton").pack(side="left", padx=(0, 12))
+ttk.Checkbutton(manual_windows_options, text="DVD read", variable=manual_windows_optical_var, style="Card.TCheckbutton").pack(side="left", padx=(0, 12))
+ttk.Checkbutton(manual_windows_options, text="USB/SD read", variable=manual_windows_removable_var, style="Card.TCheckbutton").pack(side="left", padx=(0, 12))
+ttk.Checkbutton(manual_windows_options, text="Sound L/R", variable=manual_windows_sound_var, style="Card.TCheckbutton").pack(side="left", padx=(0, 12))
+ttk.Checkbutton(manual_windows_options, text="Upload", variable=manual_windows_upload_var, style="Card.TCheckbutton").pack(side="left", padx=(0, 12))
+
 manual_windows_run_btn = ttk.Button(
     manual_windows_body,
-    text="Run Windows Tests",
+    text="Run Selected Tests",
     command=lambda: run_windows_device_tests_from_tab(),
     style="Success.TButton",
 )
-manual_windows_run_btn.grid(row=1, column=4, sticky="w", padx=(0, 18), pady=6)
+manual_windows_run_btn.grid(row=2, column=4, sticky="w", padx=(0, 18), pady=6)
+ttk.Button(
+    manual_windows_body,
+    text="Run BAT",
+    command=lambda: run_windows_device_tests_batch(),
+).grid(row=3, column=4, sticky="w", padx=(0, 18), pady=6)
 
 ttk.Label(manual_windows_body, textvariable=manual_windows_test_status_var, style="Card.TLabel").grid(
-    row=2, column=0, columnspan=5, sticky="w", pady=(6, 0)
+    row=4, column=0, columnspan=5, sticky="w", pady=(6, 0)
 )
 manual_windows_body.columnconfigure(1, weight=1)
 manual_windows_body.columnconfigure(3, weight=1)
@@ -1354,6 +1744,12 @@ setting_system_name_var = tk.StringVar()
 setting_export_folder_var = tk.StringVar()
 setting_keyboard_delay_var = tk.StringVar()
 setting_auto_refresh_var = tk.BooleanVar()
+setting_language_var = tk.StringVar(value=language_label(UI_LANGUAGE))
+windows_license_edition_var = tk.StringVar(value="Not read")
+windows_license_product_var = tk.StringVar(value="Not read")
+windows_license_key_var = tk.StringVar(value="Not read")
+windows_license_status_var = tk.StringVar(value="Not read")
+windows_license_channel_var = tk.StringVar(value="Not read")
 
 ttk.Label(settings_form, text="System Name", style="Card.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=7)
 ttk.Entry(settings_form, textvariable=setting_system_name_var, width=42).grid(
@@ -1370,15 +1766,61 @@ ttk.Label(settings_form, text="Keyboard Delay (ms)", style="Card.TLabel").grid(
 ttk.Entry(settings_form, textvariable=setting_keyboard_delay_var, width=18).grid(
     row=2, column=1, sticky="w", padx=(0, 18), pady=7
 )
+ttk.Label(settings_form, text="Language", style="Card.TLabel").grid(
+    row=3, column=0, sticky="e", padx=(0, 8), pady=7
+)
+ttk.Combobox(
+    settings_form,
+    textvariable=setting_language_var,
+    values=["Ελληνικά", "English"],
+    state="readonly",
+    width=18,
+).grid(row=3, column=1, sticky="w", padx=(0, 18), pady=7)
 ttk.Checkbutton(settings_form, text="Auto refresh dashboards after changes", variable=setting_auto_refresh_var, style="Card.TCheckbutton").grid(
-    row=3, column=1, sticky="w", pady=7
+    row=4, column=1, sticky="w", pady=7
 )
 ttk.Button(settings_form, text="Save Settings", command=lambda: save_settings(), style="Success.TButton").grid(
-    row=4, column=1, sticky="w", pady=(14, 0)
+    row=5, column=1, sticky="w", pady=(14, 0)
 )
-ttk.Button(settings_form, text="Reset Defaults", command=lambda: reset_settings()).grid(row=4, column=1, sticky="e", pady=(14, 0))
+ttk.Button(settings_form, text="Reset Defaults", command=lambda: reset_settings()).grid(row=5, column=1, sticky="e", pady=(14, 0))
 
 settings_form.columnconfigure(1, weight=1)
+
+license_card = make_card(settings_content, "Windows License")
+license_card.pack(fill="x", pady=(0, 14))
+
+license_form = tk.Frame(license_card, bg=CARD)
+license_form.pack(fill="x", padx=24, pady=(8, 20))
+
+ttk.Label(license_form, text="Edition", style="Card.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=7)
+ttk.Entry(license_form, textvariable=windows_license_edition_var, width=70, state="readonly").grid(
+    row=0, column=1, sticky="ew", padx=(0, 18), pady=7
+)
+ttk.Label(license_form, text="Product Name", style="Card.TLabel").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=7)
+ttk.Entry(license_form, textvariable=windows_license_product_var, width=70, state="readonly").grid(
+    row=1, column=1, sticky="ew", padx=(0, 18), pady=7
+)
+ttk.Label(license_form, text="Product Key", style="Card.TLabel").grid(row=2, column=0, sticky="e", padx=(0, 8), pady=7)
+ttk.Entry(license_form, textvariable=windows_license_key_var, width=70, state="readonly").grid(
+    row=2, column=1, sticky="ew", padx=(0, 18), pady=7
+)
+ttk.Label(license_form, text="Status", style="Card.TLabel").grid(row=3, column=0, sticky="e", padx=(0, 8), pady=7)
+ttk.Entry(license_form, textvariable=windows_license_status_var, width=70, state="readonly").grid(
+    row=3, column=1, sticky="ew", padx=(0, 18), pady=7
+)
+ttk.Label(license_form, text="Channel", style="Card.TLabel").grid(row=4, column=0, sticky="e", padx=(0, 8), pady=7)
+ttk.Entry(license_form, textvariable=windows_license_channel_var, width=70, state="readonly").grid(
+    row=4, column=1, sticky="ew", padx=(0, 18), pady=7
+)
+ttk.Button(license_form, text="Read Windows License", command=lambda: read_windows_license_to_settings()).grid(
+    row=0, column=2, rowspan=2, sticky="nsew", padx=4, pady=7
+)
+ttk.Label(
+    license_form,
+    text="Digital licenses may not expose a full product key.",
+    style="Card.TLabel",
+).grid(row=5, column=1, sticky="w", pady=(4, 0))
+license_form.columnconfigure(1, weight=1)
 
 maintenance_card = make_card(settings_content, "Database Maintenance")
 maintenance_card.pack(fill="x")
@@ -1543,6 +1985,30 @@ def first_line(value):
     return ""
 
 
+def clean_serial_number(value):
+    serial = first_line(value)
+    if not serial:
+        return ""
+    normalized = serial.strip().lower()
+    invalid_values = {
+        "default string",
+        "to be filled by o.e.m.",
+        "to be filled by oem",
+        "system serial number",
+        "serial number",
+        "none",
+        "unknown",
+        "not specified",
+        "not available",
+        "n/a",
+        "na",
+        "0",
+    }
+    if normalized in invalid_values:
+        return ""
+    return serial
+
+
 def format_gb(bytes_value):
     try:
         gb = int(float(bytes_value)) / (1024 ** 3)
@@ -1553,6 +2019,118 @@ def format_gb(bytes_value):
     if rounded <= 0:
         return ""
     return f"{rounded} GB"
+
+
+def join_lines(value, limit=6):
+    lines = [line.strip() for line in str(value).splitlines() if line.strip()]
+    return "; ".join(lines[:limit])
+
+
+def windows_domain_or_workgroup():
+    return first_line(
+        powershell_value(
+            "$cs=Get-CimInstance Win32_ComputerSystem; "
+            "if ($cs.PartOfDomain) { 'Domain: ' + $cs.Domain } else { 'Workgroup: ' + $cs.Workgroup }"
+        )
+    )
+
+
+def windows_secure_boot():
+    return first_line(powershell_value("try { (Confirm-SecureBootUEFI).ToString() } catch { '' }"))
+
+
+def windows_tpm_status():
+    return first_line(
+        powershell_value(
+            "try { $t=Get-Tpm; if ($null -ne $t.TpmPresent) { "
+            "'Present=' + $t.TpmPresent + '; Ready=' + $t.TpmReady + '; Enabled=' + $t.TpmEnabled } } catch { '' }"
+        )
+    )
+
+
+def windows_disk_details():
+    return join_lines(
+        powershell_value(
+            "Get-CimInstance Win32_DiskDrive | Select-Object -First 8 | "
+            "ForEach-Object { $_.Model + ' | ' + $_.InterfaceType + ' | ' + $_.MediaType + ' | ' + "
+            "([math]::Round($_.Size / 1GB).ToString() + ' GB') }"
+        ),
+        limit=8,
+    )
+
+
+def windows_volume_details():
+    return join_lines(
+        powershell_value(
+            "Get-CimInstance Win32_LogicalDisk -Filter \"DriveType=3\" | "
+            "ForEach-Object { $_.DeviceID + ' ' + ([math]::Round($_.Size / 1GB).ToString() + ' GB') + "
+            "' free ' + ([math]::Round($_.FreeSpace / 1GB).ToString() + ' GB') }"
+        ),
+        limit=8,
+    )
+
+
+def windows_network_details():
+    return join_lines(
+        powershell_value(
+            "Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled } | "
+            "Select-Object -First 6 | ForEach-Object { $_.Description + ' | MAC ' + $_.MACAddress + "
+            "' | IP ' + (($_.IPAddress | Where-Object { $_ -notlike '*:*' }) -join ', ') }"
+        ),
+        limit=6,
+    )
+
+
+def windows_battery_details():
+    return first_line(
+        powershell_value(
+            "$b=Get-CimInstance Win32_Battery | Select-Object -First 1; "
+            "if ($b) { $b.Name + ' | ' + $b.EstimatedChargeRemaining + '% | status ' + $b.BatteryStatus }"
+        )
+    )
+
+
+def windows_ram_slots():
+    used = first_line(powershell_value("(Get-CimInstance Win32_PhysicalMemory | Measure-Object).Count"))
+    total = first_line(
+        powershell_value(
+            "$arrays=Get-CimInstance Win32_PhysicalMemoryArray; "
+            "if ($arrays) { ($arrays | Measure-Object -Property MemoryDevices -Sum).Sum }"
+        )
+    )
+    if used and total:
+        return f"{used} / {total}"
+    return used
+
+
+def linux_command_lines(command, timeout=6, limit=6):
+    return join_lines(run_command(command, timeout=timeout), limit=limit)
+
+
+def linux_ram_slots():
+    dmidecode = shutil.which("dmidecode")
+    if not dmidecode:
+        return ""
+    output = run_command([dmidecode, "-t", "memory"], timeout=8)
+    if not output:
+        return ""
+    slots = 0
+    used = 0
+    in_device = False
+    current_has_size = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line == "Memory Device":
+            if in_device:
+                used += 1 if current_has_size else 0
+            slots += 1
+            in_device = True
+            current_has_size = False
+        elif in_device and line.startswith("Size:") and "No Module Installed" not in line:
+            current_has_size = True
+    if in_device:
+        used += 1 if current_has_size else 0
+    return f"{used} / {slots}" if slots else ""
 
 
 def chassis_label(chassis_value):
@@ -1659,7 +2237,17 @@ def windows_inventory():
     part_number = first_line(powershell_value("(Get-CimInstance Win32_ComputerSystemProduct).SKUNumber"))
     if not part_number:
         part_number = first_line(powershell_value("(Get-CimInstance Win32_ComputerSystemProduct).Name"))
-    serial = first_line(powershell_value("(Get-CimInstance Win32_BIOS).SerialNumber"))
+    serial = clean_serial_number(powershell_value("(Get-CimInstance Win32_BIOS).SerialNumber"))
+    if not serial:
+        serial = clean_serial_number(powershell_value("(Get-CimInstance Win32_ComputerSystemProduct).IdentifyingNumber"))
+    if not serial:
+        serial = clean_serial_number(powershell_value("(Get-CimInstance Win32_BaseBoard).SerialNumber"))
+    os_caption = first_line(powershell_value("(Get-CimInstance Win32_OperatingSystem).Caption"))
+    os_version = first_line(
+        powershell_value("$os=Get-CimInstance Win32_OperatingSystem; $os.Version + ' build ' + $os.BuildNumber")
+    )
+    motherboard = first_line(powershell_value("$bb=Get-CimInstance Win32_BaseBoard; $bb.Manufacturer + ' ' + $bb.Product"))
+    bios_version = first_line(powershell_value("(Get-CimInstance Win32_BIOS).SMBIOSBIOSVersion"))
     processor = first_line(powershell_value("(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)"))
     ram_size = first_line(
         powershell_value("[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB).ToString() + ' GB'")
@@ -1687,21 +2275,36 @@ def windows_inventory():
     ) or screen_resolution()
 
     return {
+        "Computer name": socket.gethostname(),
+        "Current user": getpass.getuser(),
+        "OS": os_caption,
+        "OS version": os_version,
+        "OS architecture": first_line(powershell_value("(Get-CimInstance Win32_OperatingSystem).OSArchitecture")),
+        "Domain / Workgroup": windows_domain_or_workgroup(),
         "Product type": product_type,
         "Manufacturer": manufacturer,
         "Model": model,
         "Chassis type": product_type,
         "Part number": part_number,
         "Serial number": serial,
+        "Motherboard": motherboard,
+        "BIOS version": bios_version,
+        "Secure Boot": windows_secure_boot(),
+        "TPM": windows_tpm_status(),
         "Processor": processor,
         "RAM size": ram_size,
+        "RAM slots used": windows_ram_slots(),
         "Disk type": disk_type,
         "Disk size": disk_size,
+        "Disk details": windows_disk_details(),
+        "Volumes": windows_volume_details(),
         "Optical drive": optical,
         "Video model": video,
         "LCD resolution": resolution,
         "LCD type": infer_screen_type_from_text(windows_monitor_text()),
         "Keyboard layout": locale_label(),
+        "Network adapters": windows_network_details(),
+        "Battery": windows_battery_details(),
     }
 
 
@@ -1769,27 +2372,45 @@ def linux_inventory():
     manufacturer = read_text_file("/sys/class/dmi/id/sys_vendor")
     model = read_text_file("/sys/class/dmi/id/product_name")
     part_number = read_text_file("/sys/class/dmi/id/product_sku")
-    serial = read_text_file("/sys/class/dmi/id/product_serial") or read_text_file("/sys/class/dmi/id/board_serial")
+    serial = clean_serial_number(read_text_file("/sys/class/dmi/id/product_serial"))
+    if not serial:
+        serial = clean_serial_number(read_text_file("/sys/class/dmi/id/board_serial"))
     chassis = read_text_file("/sys/class/dmi/id/chassis_type")
     product_type = chassis_label(chassis)
     disk_type, disk_size = linux_disk_info()
+    os_release = read_text_file("/etc/os-release")
+    os_pretty = ""
+    for line in os_release.splitlines():
+        if line.startswith("PRETTY_NAME="):
+            os_pretty = line.split("=", 1)[1].strip().strip('"')
+            break
 
     return {
+        "Computer name": socket.gethostname(),
+        "Current user": getpass.getuser(),
+        "OS": linux_command_lines(["uname", "-srmo"], limit=1),
+        "OS version": os_pretty,
         "Product type": product_type,
         "Manufacturer": manufacturer,
         "Model": model,
         "Chassis type": product_type,
         "Part number": part_number,
         "Serial number": serial,
+        "Motherboard": (read_text_file("/sys/class/dmi/id/board_vendor") + " " + read_text_file("/sys/class/dmi/id/board_name")).strip(),
+        "BIOS version": read_text_file("/sys/class/dmi/id/bios_version"),
         "Processor": linux_cpu_name(),
         "RAM size": linux_ram_size(),
+        "RAM slots used": linux_ram_slots(),
         "Disk type": disk_type,
         "Disk size": disk_size,
+        "Disk details": linux_command_lines(["lsblk", "-o", "NAME,SIZE,TYPE,MODEL"], limit=10),
+        "Volumes": linux_command_lines(["df", "-h", "--output=source,size,used,avail,pcent,target"], limit=10),
         "Optical drive": linux_optical_drive(),
         "Video model": linux_video_model(),
         "LCD resolution": screen_resolution(),
         "LCD type": infer_screen_type_from_text(linux_monitor_text()),
         "Keyboard layout": locale_label(),
+        "Network adapters": linux_command_lines(["ip", "-brief", "addr"], limit=10),
     }
 
 
@@ -1820,8 +2441,9 @@ def collect_system_inventory():
 # RECORD FUNCTIONS
 # =========================
 def clear_form():
-    global selected_id
+    global selected_id, pc_audit_batch_started
     selected_id = None
+    pc_audit_batch_started = False
 
     record_xenoglossi_entry.delete(0, tk.END)
     record_username_entry.delete(0, tk.END)
@@ -1877,7 +2499,13 @@ def load_current_pc_info():
         record_username_entry.insert(0, serial)
 
     log_action("READ_THIS_PC", f"Detected {updated} field(s) from local system")
-    messagebox.showinfo("Read This PC", f"Detected and filled {updated} field(s)")
+    message = f"Detected and filled {updated} field(s)"
+    if not serial:
+        message += (
+            "\n\nNo valid machine serial number was reported by BIOS/SystemProduct/BaseBoard. "
+            "The Serial number field was left blank."
+        )
+    messagebox.showinfo("Read This PC", message)
 
 
 def finish_read_current_pc_info(inventory, error_message):
@@ -1908,7 +2536,13 @@ def finish_read_current_pc_info(inventory, error_message):
         record_username_entry.insert(0, serial)
 
     log_action("READ_THIS_PC", f"Detected {updated} field(s) from local system")
-    messagebox.showinfo("Read This PC", f"Detected and filled {updated} field(s)")
+    message = f"Detected and filled {updated} field(s)"
+    if not serial:
+        message += (
+            "\n\nNo valid machine serial number was reported by BIOS/SystemProduct/BaseBoard. "
+            "The Serial number field was left blank."
+        )
+    messagebox.showinfo("Read This PC", message)
 
 
 def start_read_current_pc_info():
@@ -1952,13 +2586,14 @@ def load_data(filter_text=""):
 
 
 def on_select(event):
-    global selected_id
+    global selected_id, pc_audit_batch_started
 
     item = tree.focus()
     if not item:
         return
 
     selected_id = tree.item(item)["values"][0]
+    pc_audit_batch_started = False
 
     conn = get_conn()
     c = conn.cursor()
@@ -1997,9 +2632,13 @@ def validate_form():
     if not require_login():
         return False
 
+    if not pc_audit_batch_started:
+        messagebox.showerror("Validation", "Run PC Audit is required before saving")
+        return False
+
     xenoglossi = record_xenoglossi_entry.get().strip()
     if not xenoglossi:
-        messagebox.showerror("Validation", "Ξενόγλωσση is required")
+        messagebox.showerror("Validation", "Asset Tag is required")
         return False
 
     if not record_username_entry.get().strip():
@@ -2010,21 +2649,14 @@ def validate_form():
         messagebox.showerror("Validation", "Password is required for a new record")
         return False
 
-    if not dropdown.get().strip():
-        messagebox.showerror("Validation", "Please select an option")
+    serial_number = get_field(entries[SERIAL_NUMBER_INDEX]).strip()
+    if not serial_number:
+        messagebox.showerror("Validation", "Serial number is required")
+        entries[SERIAL_NUMBER_INDEX].focus_set()
         return False
 
-    conn = get_conn()
-    c = conn.cursor()
-    if selected_id:
-        c.execute("SELECT id FROM records WHERE xenoglossi=? AND id<>?", (xenoglossi, selected_id))
-    else:
-        c.execute("SELECT id FROM records WHERE xenoglossi=?", (xenoglossi,))
-    duplicate = c.fetchone()
-    conn.close()
-
-    if duplicate:
-        messagebox.showerror("Validation", "Ξενόγλωσση must be unique")
+    if not dropdown.get().strip():
+        messagebox.showerror("Validation", "Please select an option")
         return False
 
     return True
@@ -2075,6 +2707,7 @@ def submit():
 
     log_action(action, details)
     load_data()
+    populate_audit_client_filter()
     if get_setting("auto_refresh", "1") == "1":
         refresh_analytics()
         build_report(show_message=False)
@@ -2105,6 +2738,7 @@ def delete():
 
     log_action("RECORD_DELETE", f"Deleted record #{deleted_id}")
     load_data()
+    populate_audit_client_filter()
     if get_setting("auto_refresh", "1") == "1":
         refresh_analytics()
         build_report(show_message=False)
@@ -2130,7 +2764,7 @@ def export_excel():
     ws = wb.active
     ws.title = "Records"
 
-    headers = ["Ξενόγλωσση", "Timestamp", "Username", "Dropdown", "Checkbox"] + AUDITOR_FIELDS
+    headers = ["Asset Tag", "Timestamp", "Username", "Dropdown", "Checkbox"] + AUDITOR_FIELDS
     ws.append(headers)
 
     for row in data:
@@ -2172,7 +2806,7 @@ def export_json():
 
         record = {
             "internal_id": row[0],
-            "ξενόγλωσση": row[1],
+            "asset_tag": row[1],
             "timestamp": row[2],
             "username": row[3],
             "password": "hidden",
@@ -2263,6 +2897,11 @@ def get_report_rows():
         clauses.append("username LIKE ?")
         params.append(f"%{username}%")
 
+    asset_tag = report_asset_tag_var.get().strip()
+    if asset_tag:
+        clauses.append("xenoglossi LIKE ?")
+        params.append(f"%{asset_tag}%")
+
     option = report_option_var.get().strip()
     if option:
         clauses.append("dropdown = ?")
@@ -2292,7 +2931,7 @@ def get_report_rows():
 def build_report(show_message=True):
     if "report_tree" not in globals():
         return
-    if not is_logged_in:
+    if not is_logged_in or current_role != "Admin":
         return
 
     rows = get_report_rows()
@@ -2323,7 +2962,7 @@ def build_report(show_message=True):
 
 
 def export_report_excel():
-    if not require_login():
+    if not require_admin():
         return
 
     rows = get_report_rows()
@@ -2337,7 +2976,7 @@ def export_report_excel():
     wb = Workbook()
     ws = wb.active
     ws.title = "Report"
-    ws.append(["Ξενόγλωσση", "Timestamp", "Username", "Dropdown", "Checkbox"] + AUDITOR_FIELDS)
+    ws.append(["Asset Tag", "Timestamp", "Username", "Dropdown", "Checkbox"] + AUDITOR_FIELDS)
 
     for row in rows:
         input_values = normalize_input_values(row[7].split("|") if row[7] else [])
@@ -2469,6 +3108,17 @@ def client_platform_label():
     return f"{platform.system()} {platform.release()} ({platform.machine()})"
 
 
+def client_network_identity(client):
+    inventory = client.get("inventory", {}) if isinstance(client, dict) else {}
+    network_text = str(inventory.get("Network adapters", "") if isinstance(inventory, dict) else "")
+    mac_match = re.search(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b", network_text)
+    ip_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", network_text)
+    return (
+        ip_match.group(0) if ip_match else "",
+        mac_match.group(0).upper() if mac_match else "",
+    )
+
+
 def register_this_client(show_message=True):
     if not require_login():
         return False
@@ -2549,6 +3199,7 @@ def fetch_network_clients(show_message=True):
 
     for client in clients:
         name = client.get("name", "")
+        client_ip, client_mac = client_network_identity(client)
         if name:
             client_names.append(name)
         network_client_tree.insert(
@@ -2556,6 +3207,8 @@ def fetch_network_clients(show_message=True):
             "end",
             values=(
                 name,
+                client_ip,
+                client_mac,
                 client.get("username", ""),
                 client.get("role", ""),
                 client.get("last_seen", ""),
@@ -2571,6 +3224,7 @@ def fetch_network_clients(show_message=True):
 
     populate_device_results()
     populate_manual_tests()
+    populate_audit_client_filter()
 
     if show_message:
         messagebox.showinfo("Network Jobs", f"Fetched {len(clients)} client(s)")
@@ -2623,6 +3277,452 @@ def set_device_details(text):
     device_details_text.configure(state="disabled")
 
 
+def set_audit_archive_details(text):
+    if "audit_archive_details_text" not in globals():
+        return
+    audit_archive_details_text.configure(state="normal")
+    audit_archive_details_text.delete("1.0", tk.END)
+    audit_archive_details_text.insert("1.0", text)
+    audit_archive_details_text.configure(state="disabled")
+
+
+def record_row_to_local_audit(row):
+    input_values = normalize_input_values(row[7].split("|") if row[7] else [])
+    inventory = {
+        field_name: value
+        for field_name, value in zip(AUDITOR_FIELDS, input_values)
+        if str(value or "").strip()
+    }
+    inventory["Record ID"] = row[0]
+    inventory["Record Username"] = row[3]
+    inventory["Record Dropdown"] = row[5]
+    inventory["Record Accepted"] = "Yes" if row[6] else "No"
+
+    client_base = (
+        inventory.get("Computer name")
+        or inventory.get("Serial number")
+        or row[1]
+        or row[3]
+        or f"Record {row[0]}"
+    )
+    return {
+        "id": f"local-{row[0]}",
+        "source": "Local Record",
+        "record_id": row[0],
+        "client_name": f"Local - {client_base}",
+        "username": row[3],
+        "role": "Record",
+        "app_version": APP_VERSION,
+        "platform": "Local records database",
+        "inventory": inventory,
+        "diagnostics_summary": {},
+        "created_at": row[2],
+    }
+
+
+def local_record_audits(limit=500, client_filter=""):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(f"SELECT {RECORD_SELECT_COLUMNS} FROM records ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+
+    audits = []
+    client_filter = str(client_filter or "").strip()
+    for row in rows:
+        audit = record_row_to_local_audit(row)
+        if client_filter and audit["client_name"] != client_filter:
+            continue
+        audits.append(audit)
+        if limit and len(audits) >= limit:
+            break
+    return audits
+
+
+def local_record_client_names():
+    return sorted({audit["client_name"] for audit in local_record_audits(limit=0) if audit.get("client_name")})
+
+
+def populate_audit_client_filter():
+    if "audit_archive_client_combo" not in globals():
+        return
+    names = [""] + sorted(set(name for name in network_clients if name) | set(local_record_client_names()))
+    audit_archive_client_combo.configure(values=names)
+
+
+def fetch_audit_archive(show_message=True):
+    global audit_archive_records
+
+    if not require_login():
+        return
+
+    try:
+        limit = int(audit_archive_limit_var.get().strip() or "500")
+    except ValueError:
+        messagebox.showerror("Audit Archive", "Limit must be a number")
+        return
+    limit = max(1, min(limit, 5000))
+    audit_archive_limit_var.set(str(limit))
+
+    params = {"limit": str(limit)}
+    client = audit_archive_client_var.get().strip()
+    if client:
+        params["client"] = client
+
+    local_audits = local_record_audits(limit=limit, client_filter=client)
+    network_audits = []
+    network_error = ""
+
+    if save_network_settings(show_message=False):
+        try:
+            result = network_request("GET", "/audits", params=params, auth=True, timeout=10)
+            network_audits = result.get("audits", [])
+        except RuntimeError as exc:
+            network_error = str(exc)
+    else:
+        network_error = "Network settings are incomplete"
+
+    audits = local_audits + network_audits
+    audit_archive_records = {str(audit.get("id")): audit for audit in audits}
+    clear_tree(audit_archive_tree)
+
+    totals = {"OK": 0, "WARN": 0, "FAIL": 0, "UNKNOWN": 0}
+    for audit in audits:
+        summary = audit.get("diagnostics_summary", {}) if isinstance(audit, dict) else {}
+        if not isinstance(summary, dict):
+            summary = {}
+        for key in totals:
+            totals[key] += int(summary.get(key, 0) or 0)
+        audit_archive_tree.insert(
+            "",
+            "end",
+            values=(
+                audit.get("id", ""),
+                audit.get("client_name", ""),
+                audit.get("created_at", ""),
+                audit.get("platform", ""),
+                summary.get("OK", 0),
+                summary.get("WARN", 0),
+                summary.get("FAIL", 0),
+                summary.get("UNKNOWN", 0),
+            ),
+        )
+
+    audit_archive_summary_var.set(
+        f"Audits: {len(audits)} | Local: {len(local_audits)} | Network: {len(network_audits)} | "
+        f"OK: {totals['OK']} | WARN: {totals['WARN']} | "
+        f"FAIL: {totals['FAIL']} | UNKNOWN: {totals['UNKNOWN']}"
+    )
+    if show_message:
+        note = f"\n\nNetwork unavailable: {network_error}" if network_error else ""
+        messagebox.showinfo("Audit Archive", f"Loaded {len(audits)} audit record(s){note}")
+
+
+def selected_audit_id():
+    item = audit_archive_tree.focus()
+    if not item:
+        return ""
+    values = audit_archive_tree.item(item).get("values", [])
+    if not values:
+        return ""
+    return str(values[0])
+
+
+def fetch_audit_detail(audit_id):
+    if not audit_id:
+        return None
+    audit = audit_archive_records.get(str(audit_id), {})
+    if audit.get("inventory"):
+        return audit
+    result = network_request("GET", f"/audits/{audit_id}", auth=True, timeout=10)
+    detail = result.get("audit", {})
+    if detail:
+        audit_archive_records[str(audit_id)] = detail
+    return detail
+
+
+def on_audit_archive_select(event=None):
+    audit_id = selected_audit_id()
+    if not audit_id:
+        return
+    try:
+        audit = fetch_audit_detail(audit_id)
+    except RuntimeError as exc:
+        messagebox.showerror("Audit Archive", f"Could not load audit detail: {exc}")
+        return
+    set_audit_archive_details(json.dumps(audit or {}, ensure_ascii=False, indent=2))
+
+
+def load_selected_audit_to_form():
+    audit_id = selected_audit_id()
+    if not audit_id:
+        messagebox.showwarning("Audit Archive", "Select an audit first")
+        return
+    try:
+        audit = fetch_audit_detail(audit_id)
+    except RuntimeError as exc:
+        messagebox.showerror("Audit Archive", f"Could not load audit detail: {exc}")
+        return
+    inventory = audit.get("inventory", {}) if isinstance(audit, dict) else {}
+    if not inventory:
+        messagebox.showwarning("Audit Archive", "Selected audit has no inventory details")
+        return
+
+    clear_form()
+    for index, field_name in enumerate(AUDITOR_FIELDS):
+        value = inventory.get(field_name, "")
+        if value:
+            set_field(entries[index], value)
+
+    serial = inventory.get("Serial number", "")
+    record_xenoglossi_entry.insert(0, serial or audit.get("client_name", ""))
+    record_username_entry.insert(0, serial or audit.get("client_name", ""))
+    notebook.select(form_frame)
+
+
+def audit_ids_for_report():
+    selected = selected_audit_id()
+    if selected:
+        return [selected]
+    ids = []
+    for item in audit_archive_tree.get_children():
+        values = audit_archive_tree.item(item).get("values", [])
+        if values:
+            ids.append(str(values[0]))
+    return ids
+
+
+def audit_diagnostic_items(audit):
+    inventory = audit.get("inventory", {}) if isinstance(audit, dict) else {}
+    diagnostics = inventory.get("Diagnostics", {}) if isinstance(inventory, dict) else {}
+    items = diagnostics.get("items", []) if isinstance(diagnostics, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def html_escape(value):
+    return html.escape(str(value or ""), quote=True)
+
+
+def status_class(status):
+    status = str(status or "UNKNOWN").upper()
+    if status in {"OK", "WARN", "FAIL"}:
+        return status.lower()
+    return "unknown"
+
+
+def printable_report_folder():
+    folder = os.path.join(get_default_export_folder(), "print_reports")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def build_audit_html_report(audits):
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sections = []
+
+    for audit in audits:
+        inventory = audit.get("inventory", {}) if isinstance(audit.get("inventory", {}), dict) else {}
+        summary = audit.get("diagnostics_summary", {}) if isinstance(audit.get("diagnostics_summary", {}), dict) else {}
+        diagnostics = audit_diagnostic_items(audit)
+        serial_number = inventory.get("Serial number", "")
+        part_number = inventory.get("Part number", "")
+        manufacturer = inventory.get("Manufacturer", "")
+        model = inventory.get("Model", "")
+
+        inventory_rows = []
+        for field, value in inventory.items():
+            if field == "Diagnostics":
+                continue
+            inventory_rows.append(
+                f"<tr><th>{html_escape(field)}</th><td>{html_escape(value)}</td></tr>"
+            )
+
+        diagnostic_rows = []
+        if diagnostics:
+            for item in diagnostics:
+                status = str(item.get("status", "UNKNOWN")).upper()
+                diagnostic_rows.append(
+                    "<tr>"
+                    f"<td>{html_escape(item.get('name', ''))}</td>"
+                    f"<td><span class=\"badge {status_class(status)}\">{html_escape(status)}</span></td>"
+                    f"<td>{html_escape(item.get('details', ''))}</td>"
+                    "</tr>"
+                )
+        else:
+            diagnostic_rows.append("<tr><td colspan=\"3\">No diagnostics recorded</td></tr>")
+
+        sections.append(
+            f"""
+            <section class="audit">
+              <div class="audit-header">
+                <div>
+                  <h2>{html_escape(audit.get('client_name', 'Audit'))}</h2>
+                  <p>Audit #{html_escape(audit.get('id', ''))} | {html_escape(audit.get('created_at', ''))}</p>
+                </div>
+                <div class="summary">
+                  <span class="badge ok">OK {html_escape(summary.get('OK', 0))}</span>
+                  <span class="badge warn">WARN {html_escape(summary.get('WARN', 0))}</span>
+                  <span class="badge fail">FAIL {html_escape(summary.get('FAIL', 0))}</span>
+                  <span class="badge unknown">UNKNOWN {html_escape(summary.get('UNKNOWN', 0))}</span>
+                </div>
+              </div>
+              <div class="meta">
+                <div><strong>Platform</strong><br>{html_escape(audit.get('platform', ''))}</div>
+                <div><strong>User</strong><br>{html_escape(audit.get('username', ''))}</div>
+                <div><strong>Role</strong><br>{html_escape(audit.get('role', ''))}</div>
+                <div><strong>App</strong><br>{html_escape(audit.get('app_version', ''))}</div>
+                <div><strong>Manufacturer</strong><br>{html_escape(manufacturer)}</div>
+                <div><strong>Model</strong><br>{html_escape(model)}</div>
+                <div><strong>Serial number</strong><br>{html_escape(serial_number or 'Not available')}</div>
+                <div><strong>Part number</strong><br>{html_escape(part_number or 'Not available')}</div>
+              </div>
+              <h3>Inventory</h3>
+              <table class="kv"><tbody>{''.join(inventory_rows)}</tbody></table>
+              <h3>Diagnostics</h3>
+              <table>
+                <thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead>
+                <tbody>{''.join(diagnostic_rows)}</tbody>
+              </table>
+            </section>
+            """
+        )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>PC Audit Report</title>
+  <style>
+    :root {{
+      --text: #111827;
+      --muted: #4b5563;
+      --border: #d1d5db;
+      --surface: #f8fafc;
+      --ok: #15803d;
+      --warn: #b45309;
+      --fail: #b91c1c;
+      --unknown: #475569;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: white;
+      font-size: 12px;
+    }}
+    .page {{
+      width: 210mm;
+      margin: 0 auto;
+      padding: 16mm;
+    }}
+    .report-title {{
+      border-bottom: 2px solid var(--text);
+      padding-bottom: 10px;
+      margin-bottom: 18px;
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      align-items: flex-end;
+    }}
+    h1 {{ font-size: 24px; margin: 0; }}
+    h2 {{ font-size: 18px; margin: 0 0 4px; }}
+    h3 {{ font-size: 14px; margin: 18px 0 8px; }}
+    p {{ margin: 0; color: var(--muted); }}
+    .audit {{ page-break-after: always; margin-bottom: 24px; }}
+    .audit:last-child {{ page-break-after: auto; }}
+    .audit-header, .summary, .meta {{ display: flex; gap: 8px; }}
+    .audit-header {{ justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }}
+    .summary {{ flex-wrap: wrap; justify-content: flex-end; }}
+    .meta {{
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      border: 1px solid var(--border);
+      background: var(--surface);
+      margin: 12px 0 14px;
+    }}
+    .meta div {{ padding: 8px; border-right: 1px solid var(--border); }}
+    .meta div:last-child {{ border-right: 0; }}
+    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
+    th, td {{ border: 1px solid var(--border); padding: 6px 8px; vertical-align: top; word-wrap: break-word; }}
+    thead th {{ background: var(--surface); text-align: left; }}
+    .kv th {{ width: 32%; text-align: left; background: var(--surface); }}
+    .badge {{
+      display: inline-block;
+      min-width: 54px;
+      padding: 3px 7px;
+      border-radius: 4px;
+      color: white;
+      text-align: center;
+      font-weight: 700;
+      font-size: 11px;
+    }}
+    .ok {{ background: var(--ok); }}
+    .warn {{ background: var(--warn); }}
+    .fail {{ background: var(--fail); }}
+    .unknown {{ background: var(--unknown); }}
+    .actions {{ position: sticky; top: 0; padding: 8px 0; background: white; text-align: right; }}
+    button {{ padding: 7px 12px; font: inherit; }}
+    @media print {{
+      .actions {{ display: none; }}
+      body {{ background: white; }}
+      .page {{ width: auto; margin: 0; padding: 0; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="actions"><button onclick="window.print()">Print / Save PDF</button></div>
+    <header class="report-title">
+      <div>
+        <h1>PC Audit Report</h1>
+        <p>Generated {html_escape(generated)}</p>
+      </div>
+      <p>{len(audits)} audit record(s)</p>
+    </header>
+    {''.join(sections)}
+  </div>
+</body>
+</html>
+"""
+
+
+def print_audit_archive_html():
+    if not require_login():
+        return
+    ids = audit_ids_for_report()
+    if not ids:
+        messagebox.showwarning("Print Report", "Select an audit or refresh the archive first")
+        return
+
+    audits = []
+    try:
+        for audit_id in ids:
+            audit = fetch_audit_detail(audit_id)
+            if audit:
+                audits.append(audit)
+    except RuntimeError as exc:
+        messagebox.showerror("Print Report", f"Could not load audit details: {exc}")
+        return
+
+    if not audits:
+        messagebox.showwarning("Print Report", "No audit details found")
+        return
+
+    folder = printable_report_folder()
+    path = os.path.join(folder, f"pc_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(build_audit_html_report(audits))
+
+    try:
+        os.startfile(path)
+    except Exception as exc:
+        messagebox.showerror("Print Report", f"Report saved but could not be opened:\n{path}\n\n{exc}")
+        return
+
+    log_action("HTML_REPORT", f"Created printable audit report {path}")
+
+
 def browse_manual_test_path(target_var):
     path = filedialog.askdirectory(title="Select drive or mounted media")
     if path:
@@ -2657,15 +3757,14 @@ def detect_windows_test_paths():
 def parse_usb_port_count():
     value = manual_windows_usb_expected_var.get().strip()
     if not value:
-        messagebox.showerror("Manual Tests", "USB ports is required for one-by-one USB testing")
-        return None
+        return -1
     try:
         count = int(value)
     except ValueError:
         messagebox.showerror("Manual Tests", "USB ports must be a number")
         return None
-    if count <= 0:
-        messagebox.showerror("Manual Tests", "USB ports must be at least 1")
+    if count < 0:
+        messagebox.showerror("Manual Tests", "USB ports must be 0 or greater")
         return None
     return count
 
@@ -2683,17 +3782,31 @@ def usb_device_snapshot():
         return set()
 
 
-def wait_for_usb_change(baseline, seconds=7):
+def wait_for_usb_change(baseline, seconds=3.0):
     latest = set(baseline)
-    for remaining in range(seconds, 0, -1):
-        manual_windows_test_status_var.set(f"Waiting for Windows USB detection... {remaining}s")
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        manual_windows_test_status_var.set(f"Waiting for Windows USB detection... {remaining:.1f}s")
         root.update_idletasks()
         root.update()
-        time.sleep(1)
         latest = usb_device_snapshot()
         if latest != baseline:
             break
+        time.sleep(0.35)
     return latest
+
+
+def run_fast_usb_detection_test(expected_count):
+    try:
+        from register_client import pc_auditor_usb_detection_test
+
+        return pc_auditor_usb_detection_test(
+            expected_usb_devices=expected_count,
+            non_interactive=True,
+        )
+    except Exception as exc:
+        return test_item("Test USB device detection", "UNKNOWN", f"USB detection failed: {exc}")
 
 
 def run_usb_ports_one_by_one_gui(port_count):
@@ -2724,13 +3837,17 @@ def run_usb_ports_one_by_one_gui(port_count):
 
         if not messagebox.askokcancel(
             name,
-            f"Plug the known-good USB device into USB port {port_index}, wait for Windows to detect it, then press OK.",
+            f"Plug the known-good USB device into USB port {port_index}.\n\n"
+            "Press OK after Windows detects it, or immediately after plugging it in.",
         ):
             items.append(test_item(name, "UNKNOWN", "Skipped before device insertion"))
             skipped += 1
             continue
 
-        after = wait_for_usb_change(baseline)
+        manual_windows_test_status_var.set(f"Checking USB port {port_index}...")
+        after = usb_device_snapshot()
+        if after == baseline:
+            after = wait_for_usb_change(baseline)
         added = sorted(after - baseline)
         removed = sorted(baseline - after)
 
@@ -2861,15 +3978,29 @@ def run_windows_device_tests_from_tab():
         return
 
     if not platform.system().lower().startswith("win"):
-        messagebox.showwarning("Manual Tests", "These four required tests are Windows-only")
+        messagebox.showwarning("Manual Tests", "Windows device tests are Windows-only")
         return
 
-    if not save_network_settings(show_message=False):
+    selected_tests = {
+        "usb_ports": manual_windows_usb_ports_var.get(),
+        "fast_usb": manual_windows_fast_usb_var.get(),
+        "optical": manual_windows_optical_var.get(),
+        "removable": manual_windows_removable_var.get(),
+        "sound": manual_windows_sound_var.get(),
+        "upload": manual_windows_upload_var.get(),
+    }
+    if not any(selected_tests[key] for key in ("usb_ports", "optical", "removable", "sound")):
+        messagebox.showerror("Manual Tests", "Select at least one Windows device test")
         return
 
-    usb_port_count = parse_usb_port_count()
-    if usb_port_count is None:
+    if selected_tests["upload"] and not save_network_settings(show_message=False):
         return
+
+    usb_port_count = None
+    if selected_tests["usb_ports"]:
+        usb_port_count = parse_usb_port_count()
+        if usb_port_count is None:
+            return
 
     server_url = network_base_url()
     client_name = workstation_name_var.get().strip()
@@ -2877,8 +4008,18 @@ def run_windows_device_tests_from_tab():
     usb_path = manual_windows_usb_path_var.get().strip()
 
     set_windows_test_controls_running(True)
-    manual_windows_test_status_var.set("Starting USB port one-by-one test...")
-    usb_items = run_usb_ports_one_by_one_gui(usb_port_count)
+    items = []
+    if selected_tests["usb_ports"]:
+        if selected_tests["fast_usb"]:
+            manual_windows_test_status_var.set("Running fast USB detection test...")
+            items.append(run_fast_usb_detection_test(usb_port_count))
+        else:
+            if usb_port_count <= 0:
+                messagebox.showerror("Manual Tests", "USB ports must be at least 1 when Fast USB is off")
+                set_windows_test_controls_running(False)
+                return
+            manual_windows_test_status_var.set("Starting USB port one-by-one test...")
+            items.extend(run_usb_ports_one_by_one_gui(usb_port_count))
     manual_windows_test_status_var.set("Running optical and removable media tests...")
 
     def worker():
@@ -2894,20 +4035,31 @@ def run_windows_device_tests_from_tab():
                 optical_test_path=optical_path,
                 usb_test_path=usb_path,
             )
-            items = list(usb_items) + [
-                pc_auditor_optical_read_test(args),
-                pc_auditor_removable_read_test(args),
-            ]
-            root.after(0, lambda: finish_windows_device_tests_from_tab(items, server_url, client_name))
+            worker_items = list(items)
+            if selected_tests["optical"]:
+                worker_items.append(pc_auditor_optical_read_test(args))
+            if selected_tests["removable"]:
+                worker_items.append(pc_auditor_removable_read_test(args))
+            root.after(
+                0,
+                lambda: finish_windows_device_tests_from_tab(
+                    worker_items,
+                    server_url,
+                    client_name,
+                    run_sound=selected_tests["sound"],
+                    upload=selected_tests["upload"],
+                ),
+            )
         except Exception as exc:
             root.after(0, lambda exc=exc: handle_windows_device_tests_error(exc))
 
     threading.Thread(target=worker, daemon=True).start()
 
 
-def finish_windows_device_tests_from_tab(items, server_url, client_name):
-    manual_windows_test_status_var.set("Playing left/right sound test...")
-    items.append(run_windows_sound_test_gui())
+def finish_windows_device_tests_from_tab(items, server_url, client_name, run_sound=True, upload=True):
+    if run_sound:
+        manual_windows_test_status_var.set("Playing left/right sound test...")
+        items.append(run_windows_sound_test_gui())
 
     diagnostics = {"items": items, "summary": summarize_test_items(items)}
     inventory = collect_system_inventory()
@@ -2921,6 +4073,10 @@ def finish_windows_device_tests_from_tab(items, server_url, client_name):
         "inventory": inventory,
     }
 
+    if not upload:
+        complete_windows_device_tests_local(payload)
+        return
+
     manual_windows_test_status_var.set("Uploading Windows test results...")
 
     def upload_worker():
@@ -2928,12 +4084,12 @@ def finish_windows_device_tests_from_tab(items, server_url, client_name):
             result = post_client_registration(server_url, payload, timeout=8)
             root.after(0, lambda: complete_windows_device_tests_upload(payload, result))
         except Exception as exc:
-            root.after(0, lambda exc=exc: handle_windows_device_tests_error(exc))
+            root.after(0, lambda exc=exc: complete_windows_device_tests_local(payload, upload_error=exc))
 
     threading.Thread(target=upload_worker, daemon=True).start()
 
 
-def complete_windows_device_tests_upload(payload, result):
+def apply_windows_device_tests_payload(payload):
     global network_clients
 
     client_name = payload.get("name", "")
@@ -2951,7 +4107,11 @@ def complete_windows_device_tests_upload(payload, result):
     populate_device_results()
     populate_manual_tests()
     set_windows_test_controls_running(False)
+    return payload.get("inventory", {}).get("Diagnostics", {})
 
+
+def complete_windows_device_tests_upload(payload, result):
+    diagnostics = apply_windows_device_tests_payload(payload)
     diagnostics = payload.get("inventory", {}).get("Diagnostics", {})
     summary = diagnostics.get("summary", {}) if isinstance(diagnostics, dict) else {}
     manual_windows_test_status_var.set(
@@ -2960,6 +4120,22 @@ def complete_windows_device_tests_upload(payload, result):
     )
     log_action("WINDOWS_DEVICE_TESTS", f"Saved Windows device tests for {client_name}")
     messagebox.showinfo("Manual Tests", "Windows device tests completed and saved")
+
+
+def complete_windows_device_tests_local(payload, upload_error=None):
+    diagnostics = apply_windows_device_tests_payload(payload)
+    summary = diagnostics.get("summary", {}) if isinstance(diagnostics, dict) else {}
+    suffix = f" | upload failed: {upload_error}" if upload_error else " | local only"
+    manual_windows_test_status_var.set(
+        f"Windows tests local | OK: {summary.get('OK', 0)} | WARN: {summary.get('WARN', 0)} | "
+        f"FAIL: {summary.get('FAIL', 0)} | UNKNOWN: {summary.get('UNKNOWN', 0)}{suffix}"
+    )
+    client_name = payload.get("name", "")
+    log_action("WINDOWS_DEVICE_TESTS_LOCAL", f"Saved local Windows device tests for {client_name}{suffix}")
+    if upload_error:
+        messagebox.showwarning("Manual Tests", f"Windows tests completed locally, but upload failed:\n{upload_error}")
+    else:
+        messagebox.showinfo("Manual Tests", "Windows device tests completed locally")
 
 
 def handle_windows_device_tests_error(exc):
@@ -3325,7 +4501,7 @@ def publish_current_form_job():
     filled_values = [value for value in payload["inputs"] if value]
 
     if not xenoglossi:
-        messagebox.showerror("Network Jobs", "Ξενόγλωσση is required before publishing")
+        messagebox.showerror("Network Jobs", "Asset Tag is required before publishing")
         return
 
     if not filled_values:
@@ -3431,6 +4607,7 @@ def fail_selected_network_job():
 network_tree.bind("<<TreeviewSelect>>", show_selected_network_job_details)
 network_client_tree.bind("<<TreeviewSelect>>", on_network_client_select)
 device_results_tree.bind("<<TreeviewSelect>>", on_device_result_select)
+audit_archive_tree.bind("<<TreeviewSelect>>", on_audit_archive_select)
 manual_tests_tree.bind("<<TreeviewSelect>>", on_manual_test_select)
 
 
@@ -3607,6 +4784,7 @@ def load_settings_ui():
     setting_system_name_var.set(get_setting("system_name", APP_TITLE))
     setting_export_folder_var.set(get_setting("default_export_folder", BASE_DIR))
     setting_keyboard_delay_var.set(get_setting("keyboard_delay", "80"))
+    setting_language_var.set(language_label(get_setting("language", UI_LANGUAGE)))
     setting_auto_refresh_var.set(get_setting("auto_refresh", "1") == "1")
     load_batch_files()
 
@@ -3617,6 +4795,163 @@ def choose_export_folder():
         setting_export_folder_var.set(folder)
 
 
+def license_status_label(value):
+    labels = {
+        "0": "Unlicensed",
+        "1": "Licensed",
+        "2": "OOB grace",
+        "3": "OOT grace",
+        "4": "Non-genuine grace",
+        "5": "Notification",
+        "6": "Extended grace",
+    }
+    return labels.get(str(value).strip(), str(value or "").strip())
+
+
+def windows_activation_xpr_status():
+    script = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "slmgr.vbs")
+    if not os.path.exists(script):
+        return ""
+    output = run_command(["cscript", "//nologo", script, "/xpr"], timeout=10)
+    lower = output.lower()
+    if "permanent" in lower or "activated" in lower:
+        return "Licensed"
+    if output.strip():
+        return "Activated / see Windows activation details"
+    return ""
+
+
+def first_pipe_parts(value, count):
+    line = first_line(value)
+    parts = [part.strip() for part in line.split("|")] if line else []
+    while len(parts) < count:
+        parts.append("")
+    return parts[:count]
+
+
+def read_windows_license_info():
+    if not platform.system().lower().startswith("win"):
+        raise RuntimeError("Windows license reading is available only on Windows")
+
+    product_name, edition_id, display_version, current_build = first_pipe_parts(
+        powershell_value(
+            "$cv=Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'; "
+            "$cv.ProductName + '|' + $cv.EditionID + '|' + $cv.DisplayVersion + '|' + $cv.CurrentBuild"
+        ),
+        4,
+    )
+    caption = first_line(powershell_value("(Get-CimInstance Win32_OperatingSystem).Caption"))
+    if caption:
+        product_name = caption
+    elif product_name.startswith("Microsoft Windows 10"):
+        try:
+            if int(current_build) >= 22000:
+                product_name = product_name.replace("Windows 10", "Windows 11", 1)
+        except ValueError:
+            pass
+    firmware_key = first_line(powershell_value("(Get-CimInstance SoftwareLicensingService).OA3xOriginalProductKey"))
+    backup_key = first_line(
+        powershell_value(
+            "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SoftwareProtectionPlatform').BackupProductKeyDefault"
+        )
+    )
+    product_key = firmware_key or backup_key or "Not available"
+
+    license_query = (
+        "$products=Get-CimInstance SoftwareLicensingProduct | "
+        "Where-Object { $_.Name -like '*Windows*' -and $null -ne $_.LicenseStatus }; "
+        "$p=$products | Sort-Object @{Expression={$_.LicenseStatus -eq 1};Descending=$true}, LicenseStatus -Descending | "
+        "Select-Object -First 1; "
+        "if ($p) { $p.Name + '|' + $p.Description + '|' + $p.LicenseStatus + '|' + $p.PartialProductKey }"
+    )
+    license_name, license_description, license_status, partial_key = first_pipe_parts(
+        powershell_value(license_query),
+        4,
+    )
+    if not license_status:
+        license_name, license_description, license_status, partial_key = first_pipe_parts(
+            powershell_value(
+                "$p=Get-CimInstance SoftwareLicensingProduct | "
+                "Where-Object { $_.ApplicationID -eq '55c92734-d682-4d71-983e-d6ec3f16059f' } | "
+                "Sort-Object @{Expression={$_.LicenseStatus -eq 1};Descending=$true}, LicenseStatus -Descending | "
+                "Select-Object -First 1; "
+                "if ($p) { $p.Name + '|' + $p.Description + '|' + $p.LicenseStatus + '|' + $p.PartialProductKey }"
+            ),
+            4,
+        )
+    if not license_status:
+        license_status = windows_activation_xpr_status()
+
+    if license_status and license_status.isdigit():
+        license_status = license_status_label(license_status)
+
+    if not partial_key:
+        partial_key = first_line(
+            powershell_value(
+                "$p=Get-CimInstance SoftwareLicensingProduct | Where-Object { $_.PartialProductKey } | "
+                "Select-Object -First 1; if ($p) { $p.PartialProductKey }"
+            )
+        )
+
+    old_license_name, old_license_description, old_license_status, old_partial_key = first_pipe_parts(
+        powershell_value(
+            "$p=Get-CimInstance SoftwareLicensingProduct | "
+            "Where-Object { $_.ApplicationID -eq '55c92734-d682-4d71-983e-d6ec3f16059f' -and $_.PartialProductKey } | "
+            "Select-Object -First 1; "
+            "if ($p) { $p.Name + '|' + $p.Description + '|' + $p.LicenseStatus + '|' + $p.PartialProductKey }"
+        ),
+        4,
+    )
+    license_name = license_name or old_license_name
+    license_description = license_description or old_license_description
+    partial_key = partial_key or old_partial_key
+    channel = ""
+    description_upper = license_description.upper()
+    for candidate in ("OEM", "RETAIL", "VOLUME", "MAK", "KMS"):
+        if candidate in description_upper:
+            channel = candidate
+            break
+
+    return {
+        "edition": edition_id or caption,
+        "product_name": product_name or caption or license_name,
+        "display_version": display_version,
+        "build": current_build,
+        "product_key": product_key,
+        "license_status": license_status or "Unknown",
+        "partial_key": partial_key,
+        "channel": channel or license_description or "Unknown",
+    }
+
+
+def read_windows_license_to_settings():
+    try:
+        info = read_windows_license_info()
+    except Exception as exc:
+        messagebox.showerror("Windows License", str(exc))
+        return
+
+    version_bits = []
+    if info.get("display_version"):
+        version_bits.append(info["display_version"])
+    if info.get("build"):
+        version_bits.append("build " + info["build"])
+    edition = info.get("edition", "")
+    if version_bits:
+        edition = f"{edition} ({', '.join(version_bits)})"
+
+    status = info.get("license_status", "")
+    if info.get("partial_key"):
+        status = f"{status} | partial key {info['partial_key']}"
+
+    windows_license_edition_var.set(edition or "Unknown")
+    windows_license_product_var.set(info.get("product_name", "") or "Unknown")
+    windows_license_key_var.set(info.get("product_key", "") or "Not available")
+    windows_license_status_var.set(status or "Unknown")
+    windows_license_channel_var.set(info.get("channel", "") or "Unknown")
+    log_action("WINDOWS_LICENSE_READ", f"Read Windows license info: {windows_license_product_var.get()}")
+
+
 def save_settings():
     if not require_admin():
         return
@@ -3624,6 +4959,7 @@ def save_settings():
     system_name = setting_system_name_var.get().strip() or APP_TITLE
     export_folder = setting_export_folder_var.get().strip() or BASE_DIR
     delay = setting_keyboard_delay_var.get().strip() or "80"
+    language = language_code(setting_language_var.get())
 
     if not os.path.isdir(export_folder):
         messagebox.showerror("Settings", "Export folder does not exist")
@@ -3640,12 +4976,14 @@ def save_settings():
     set_setting("system_name", system_name)
     set_setting("default_export_folder", export_folder)
     set_setting("keyboard_delay", delay_int)
+    set_setting("language", language)
     set_setting("auto_refresh", "1" if setting_auto_refresh_var.get() else "0")
 
     root.title(system_name)
     title_label.config(text=system_name)
     log_action("SETTINGS_SAVE", "Saved application settings")
-    messagebox.showinfo("Settings", "Settings saved")
+    restart_note = "\n\nRestart the app to apply language changes." if language != UI_LANGUAGE else ""
+    messagebox.showinfo("Settings", "Settings saved" + restart_note)
 
 
 def reset_settings():
@@ -3722,7 +5060,7 @@ def resolve_batch_path(name):
     return path
 
 
-def launch_batch_file(name):
+def launch_batch_file(name, env_updates=None):
     if not platform.system().lower().startswith("win"):
         raise RuntimeError("Batch launcher is available only on Windows")
 
@@ -3731,6 +5069,8 @@ def launch_batch_file(name):
     creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
     env = os.environ.copy()
     env["RUN_BACKGROUND"] = "1"
+    if env_updates:
+        env.update({str(key): str(value) for key, value in env_updates.items()})
     process = subprocess.Popen(
         [cmd, "/c", path],
         cwd=BASE_DIR,
@@ -3741,6 +5081,51 @@ def launch_batch_file(name):
         env=env,
     )
     return path, process.pid
+
+
+def run_windows_device_tests_batch():
+    if not require_login():
+        return
+
+    if not platform.system().lower().startswith("win"):
+        messagebox.showwarning("Manual Tests", "Windows device tests are available only on Windows")
+        return
+
+    if not save_network_settings(show_message=False):
+        return
+
+    batch_name = "windows_device_tests.bat"
+    env_updates = {
+        "JOB_SERVER_URL": network_base_url(),
+        "CLIENT_NAME": workstation_name_var.get().strip(),
+    }
+    try:
+        path, pid = launch_batch_file(batch_name, env_updates=env_updates)
+    except Exception as exc:
+        messagebox.showerror("Manual Tests", f"Could not start {batch_name}:\n{exc}")
+        return
+
+    manual_windows_test_status_var.set(f"Started {os.path.basename(path)} in background pid={pid}")
+    log_action("WINDOWS_DEVICE_TESTS_BATCH", f"Started {os.path.basename(path)} pid={pid}")
+    messagebox.showinfo("Manual Tests", f"Started {os.path.basename(path)} in background")
+
+
+def run_pc_audit_batch():
+    global pc_audit_batch_started
+
+    if not require_login():
+        return
+
+    batch_name = "start_pc_audit.bat"
+    try:
+        path, pid = launch_batch_file(batch_name)
+    except Exception as exc:
+        messagebox.showerror("PC Audit", f"Could not start {batch_name}:\n{exc}")
+        return
+
+    pc_audit_batch_started = True
+    log_action("PC_AUDIT_BATCH_START", f"Started {os.path.basename(path)} pid={pid}")
+    messagebox.showinfo("PC Audit", f"Started {os.path.basename(path)} in background")
 
 
 def run_batch_file_names(names):
@@ -4005,101 +5390,32 @@ root.bind("<F1>", apply_keyboard_actions)
 # NOTEBOOK EVENTS
 # =========================
 def on_tab_changed(event):
-    tab_text = notebook.tab(notebook.select(), "text")
-    if tab_text == "Analytics":
+    selected = notebook.select()
+    if selected == str(analytics_frame):
         refresh_analytics()
-    elif tab_text == "Reports":
+    elif selected == str(reports_frame):
         build_report(show_message=False)
-    elif tab_text == "Network Jobs":
+    elif selected == str(network_frame):
         load_network_settings_ui()
-    elif tab_text == "Device Results":
+    elif selected == str(device_results_frame):
         load_network_settings_ui()
         refresh_device_results()
-    elif tab_text == "Manual Tests":
+    elif selected == str(audit_archive_frame):
+        load_network_settings_ui()
+        populate_audit_client_filter()
+        fetch_audit_archive(show_message=False)
+    elif selected == str(manual_tests_frame):
         load_network_settings_ui()
         refresh_manual_tests()
-    elif tab_text == "Users":
+    elif selected == str(users_frame):
         load_users()
-    elif tab_text == "Settings":
+    elif selected == str(settings_frame):
         load_settings_ui()
-    elif tab_text == "Logs":
+    elif selected == str(logs_frame):
         load_logs()
 
 
 notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
-
-
-# =========================
-# ACTION BUTTONS
-# =========================
-tk.Button(
-    action_bar,
-    text="New / Clear",
-    command=clear_form,
-    bg="#475569",
-    fg="white",
-    font=("Segoe UI", 10, "bold"),
-    relief="flat",
-    padx=14,
-    pady=7,
-).pack(side="left", padx=6, pady=9)
-tk.Button(
-    action_bar,
-    text="Save / Update",
-    command=submit,
-    bg="#16a34a",
-    fg="white",
-    font=("Segoe UI", 10, "bold"),
-    relief="flat",
-    padx=14,
-    pady=7,
-).pack(side="left", padx=6, pady=9)
-tk.Button(
-    action_bar,
-    text="Delete",
-    command=delete,
-    bg="#dc2626",
-    fg="white",
-    font=("Segoe UI", 10, "bold"),
-    relief="flat",
-    padx=14,
-    pady=7,
-).pack(side="left", padx=6, pady=9)
-tk.Button(
-    action_bar,
-    text="Export Excel",
-    command=export_excel,
-    bg="#2563eb",
-    fg="white",
-    font=("Segoe UI", 10, "bold"),
-    relief="flat",
-    padx=14,
-    pady=7,
-).pack(side="left", padx=6, pady=9)
-tk.Button(
-    action_bar,
-    text="Export JSON",
-    command=export_json,
-    bg="#7c3aed",
-    fg="white",
-    font=("Segoe UI", 10, "bold"),
-    relief="flat",
-    padx=14,
-    pady=7,
-).pack(side="left", padx=6, pady=9)
-tk.Button(
-    action_bar,
-    text="Apply Keys (F1)",
-    command=apply_keyboard_actions,
-    bg="#f59e0b",
-    fg="black",
-    font=("Segoe UI", 10, "bold"),
-    relief="flat",
-    padx=14,
-    pady=7,
-).pack(side="left", padx=6, pady=9)
-
-ttk.Label(action_bar, text=f"Version {APP_VERSION}", style="Muted.TLabel").pack(side="right", padx=5)
 
 
 # =========================
@@ -4115,5 +5431,6 @@ load_users()
 load_logs()
 refresh_analytics()
 set_protected_tabs("hidden")
+apply_ui_language(root)
 
 root.mainloop()

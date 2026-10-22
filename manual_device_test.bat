@@ -8,10 +8,10 @@ set "CLIENT_NAME=%COMPUTERNAME%"
 cd /d "%~dp0"
 if "%RUN_BACKGROUND%"=="1" (
     rem Manual checklist needs visible prompts, so background mode only registers this client safely.
-    python register_client.py --server "%SERVER_URL%" --name "%CLIENT_NAME%" --once
+    py -3 register_client.py --server "%SERVER_URL%" --name "%CLIENT_NAME%" --once
     exit /b %ERRORLEVEL%
 )
 
-python register_client.py --server "%SERVER_URL%" --name "%CLIENT_NAME%" --manual-tests --once
+py -3 register_client.py --server "%SERVER_URL%" --name "%CLIENT_NAME%" --manual-tests --once
 
 pause
