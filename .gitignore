@@ -31,3 +31,4 @@ print_reports/
 pxe_wim_toolkit/build/
 pxe_wim_toolkit/drivers/host_export/
 pxe_wim_toolkit/portable_python/
+.qodo/
