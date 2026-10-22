@@ -1,0 +1,2 @@
+pxe_wim_toolkit/build/** filter=lfs diff=lfs merge=lfs -text
+pxe_wim_toolkit/drivers/host_export/** filter=lfs diff=lfs merge=lfs -text
